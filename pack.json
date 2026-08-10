@@ -1,0 +1,13 @@
+{
+  "name": "rigOsc",
+  "url": "https://github.com/rigkid/rigOsc.git",
+  "ref": "main",
+  "version": "0.1.0",
+  "author": "Rigkid",
+  "license": "MIT Rigkid Contributors",
+  "description": "UDP OSC transport + network identity / show bus PODs for installs.",
+  "dependencies": [],
+  "include_paths": [
+    "src"
+  ]
+}

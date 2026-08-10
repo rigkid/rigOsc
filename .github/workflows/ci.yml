@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+
+env:
+  PACK: rigOsc
+  HERO: osc
+
+jobs:
+  example:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check private-repo CI token
+        env:
+          RIGKIT_CI_TOKEN: ${{ secrets.RIGKIT_CI_TOKEN }}
+        run: |
+          if [ -z "$RIGKIT_CI_TOKEN" ]; then
+            echo "::warning::No RIGKIT_CI_TOKEN. Public remotes still clone."
+          fi
+
+      - name: Checkout pack
+        uses: actions/checkout@v4
+        with:
+          path: pack
+
+      - name: Checkout RigKit host
+        uses: actions/checkout@v4
+        with:
+          repository: rigkid/RigKit
+          path: host
+          submodules: recursive
+          token: ${{ secrets.RIGKIT_CI_TOKEN || github.token }}
+
+      - name: Overlay pack under test
+        run: |
+          rm -rf "host/packs/${PACK}"
+          mkdir -p host/packs
+          cp -a pack "host/packs/${PACK}"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build pkg-config \
+            libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
+            libgl1-mesa-dev \
+            libwayland-dev libwayland-bin libxkbcommon-dev \
+            xvfb
+
+      - name: Configure hero
+        working-directory: host
+        run: >
+          cmake -S "packs/${PACK}/examples/${HERO}"
+          -B "packs/${PACK}/examples/${HERO}/build"
+          -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build hero
+        working-directory: host
+        run: cmake --build "packs/${PACK}/examples/${HERO}/build" --target ${HERO}
+
+      - name: Smoke OSC loopback
+        working-directory: host
+        run: |
+          BIN=$(find "packs/${PACK}/examples/${HERO}/build" -type f -name "${HERO}" -executable | head -1)
+          test -n "$BIN"
+          xvfb-run -a "$BIN" --smoke-osc

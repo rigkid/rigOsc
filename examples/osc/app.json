@@ -1,0 +1,13 @@
+{
+  "name": "osc",
+  "version": "0.1.0",
+  "license": "MIT",
+  "description": "rigOsc hero — show-bus lamp (Master / Blackout).",
+  "window": { "width": 800, "height": 480, "title": "rigOsc - osc" },
+  "dependencies": [
+    { "name": "rigComponent", "url": "https://github.com/rigkid/rigComponent.git", "ref": "main" },
+    { "name": "rigSystems", "url": "https://github.com/rigkid/rigSystems.git", "ref": "main" },
+    { "name": "rigOsc", "url": "https://github.com/rigkid/rigOsc.git", "ref": "main" },
+    { "name": "rigImGui", "url": "https://github.com/rigkid/rigImGui.git", "ref": "main" }
+  ]
+}
