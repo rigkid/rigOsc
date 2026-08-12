@@ -15,8 +15,7 @@
 namespace rigkit {
 
 rigOsc::rigOsc() : IPack("rigOsc") {
-	setDescription("UDP OSC transport + network identity / show bus");
-	m_sock = std::make_unique<osc::UdpSocket>();
+		m_sock = std::make_unique<osc::UdpSocket>();
 }
 
 rigOsc::~rigOsc() {
