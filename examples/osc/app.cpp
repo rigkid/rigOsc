@@ -139,7 +139,7 @@ void OscHeroApp::parseCommandLineArgs(const rigkit::CommandLineArgs& args) {
 		m_screenshot = true;
 	}
 	if (args.hasFlag("help") || args.hasFlag("h")) {
-		std::cout << "osc — rigOsc hero (show-bus lamp)\n\n"
+		std::cout << "osc — rigOsc example (show-bus lamp)\n\n"
 				  << "  --smoke-osc                 Bind UDP, loopback master, exit\n"
 				  << "  --screenshot[=PATH]         Capture framebuffer PNG and exit\n"
 				  << rigkit::rigOsc::commandLineHelp() << "\n"

@@ -12,7 +12,7 @@ namespace rigkit {
 class rigOsc;
 }
 
-/// Hero for rigOsc: lamp follows Master / Blackout / Color on the show bus.
+/// Example for rigOsc: lamp follows Master / Blackout / Color on the show bus.
 class OscHeroApp : public rigkit::IApp {
   public:
 	OscHeroApp();
