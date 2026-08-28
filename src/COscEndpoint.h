@@ -8,7 +8,7 @@ namespace rigkit {
 namespace ecs {
 
 /**
- * @brief OSC UDP listen / send endpoints — data only.
+ * @brief OSC UDP listen / send endpoints - data only.
  * @details Speaks `rig.io.osc`. Socket handles live in rigOsc transport code,
  * never here.
  */
@@ -18,7 +18,7 @@ struct COscEndpoint {
 	bool sendEnabled = true;
 	std::string sendHost = "127.0.0.1";
 	int sendPort = 8001;
-	std::string addressPrefix = "/rigkit"; ///< /rigkit/<networkId>/…
+	std::string addressPrefix = "/rigkit"; ///< Prefix before `networkId` (default `/rigkit`).
 
 	std::vector<sProp> GetProperties() {
 		return {{0, "Listen", EPT_BOOL, &listenEnabled},

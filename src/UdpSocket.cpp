@@ -1,4 +1,5 @@
 #include "UdpSocket.h"
+
 #include <cstring>
 
 #ifdef _WIN32
@@ -77,7 +78,7 @@ bool UdpSocket::bind(const std::string& address, int port) {
 	}
 	u_long nonblock = 1;
 	ioctlsocket(s, FIONBIO, &nonblock);
-	// Exclusive bind — SO_REUSEADDR on Windows UDP lets a second process "bind"
+	// Exclusive bind - SO_REUSEADDR on Windows UDP lets a second process "bind"
 	// the same port, then loopback / peer datagrams land on the first socket.
 	BOOL exclusive = 1;
 	setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&exclusive),
@@ -90,7 +91,7 @@ bool UdpSocket::bind(const std::string& address, int port) {
 	}
 	int flags = fcntl(s, F_GETFL, 0);
 	fcntl(s, F_SETFL, flags | O_NONBLOCK);
-	// No SO_REUSEADDR — second listener on the same port must fail with EADDRINUSE.
+	// No SO_REUSEADDR - second listener on the same port must fail with EADDRINUSE.
 #endif
 
 	sockaddr_in addr{};
@@ -111,11 +112,11 @@ bool UdpSocket::bind(const std::string& address, int port) {
 	if (::bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
 #ifdef _WIN32
 		const int err = WSAGetLastError();
-		m_error = (err == WSAEADDRINUSE) ? "bind() failed — port in use"
+		m_error = (err == WSAEADDRINUSE) ? "bind() failed - port in use"
 										 : "bind() failed";
 		closesocket(s);
 #else
-		m_error = (errno == EADDRINUSE) ? "bind() failed — port in use" : "bind() failed";
+		m_error = (errno == EADDRINUSE) ? "bind() failed - port in use" : "bind() failed";
 		::close(s);
 #endif
 		return false;

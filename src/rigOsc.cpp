@@ -1,16 +1,18 @@
 #include "rigOsc.h"
-#include <algorithm>
-#include <chrono>
-#include <cmath>
-#include <string>
-#include <thread>
-#include <spdlog/spdlog.h>
+
+#include "core/pack/PackRegistry.h"
+#include "core/RigKitEngine.h"
 #include "CNetworkIdentity.h"
 #include "COscEndpoint.h"
 #include "COscShowBus.h"
 #include "UdpSocket.h"
-#include "core/RigKitEngine.h"
-#include "core/pack/PackRegistry.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <spdlog/spdlog.h>
+#include <string>
+#include <thread>
 
 namespace rigkit {
 
@@ -63,7 +65,7 @@ void rigOsc::setup() {
 	ecs->registerComponent<ecs::COscShowBus>("OscShowBus", true);
 	ensureEntity();
 	applyEndpoint();
-	spdlog::info("[rigOsc] setup — id='{}' listen {}:{}", identity().networkId,
+	spdlog::info("[rigOsc] setup - id='{}' listen {}:{}", identity().networkId,
 				 identity().bindAddress, endpoint().listenPort);
 }
 
@@ -113,10 +115,10 @@ bool rigOsc::applyEndpoint() {
 	}
 	if (!m_sock->bind(id.bindAddress, ep.listenPort)) {
 		m_lastError = m_sock->lastError();
-		spdlog::error("[rigOsc] bind {}:{} failed — {}", id.bindAddress, ep.listenPort, m_lastError);
+		spdlog::error("[rigOsc] bind {}:{} failed - {}", id.bindAddress, ep.listenPort, m_lastError);
 		return false;
 	}
-	// Port 0 → kernel picks ephemeral; record the real bound port.
+	// Port 0 to kernel picks ephemeral; record the real bound port.
 	m_boundPort = m_sock->port();
 	if (ep.listenPort == 0) {
 		ep.listenPort = m_boundPort;
@@ -382,7 +384,7 @@ bool rigOsc::smokeLoopback() {
 	auto& ep = endpoint();
 	auto& id = identity();
 
-	// Snapshot caller endpoint — smoke must not steal a peer's listen port.
+	// Snapshot caller endpoint - smoke must not steal a peer's listen port.
 	const bool savedListenEn = ep.listenEnabled;
 	const bool savedSendEn = ep.sendEnabled;
 	const int savedListenPort = ep.listenPort;
@@ -404,7 +406,7 @@ bool rigOsc::smokeLoopback() {
 	ep.sendEnabled = true;
 	ep.sendHost = "127.0.0.1";
 	id.bindAddress = "127.0.0.1";
-	ep.listenPort = 0; // ephemeral — never collide with another instance on 8000
+	ep.listenPort = 0; // ephemeral - never collide with another instance on 8000
 	if (!applyEndpoint()) {
 		restore();
 		return false;

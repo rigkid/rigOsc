@@ -3,10 +3,11 @@
 #include <memory>
 #include <string>
 #include <vector>
-#include "OscCodec.h"
+
 #include "core/pack/IPack.h"
 #include "core/util/CommandLineArgs.h"
 #include "ecs/MEcs.h"
+#include "OscCodec.h"
 
 namespace rigkit {
 
@@ -22,10 +23,10 @@ class UdpSocket;
 
 /**
  * @brief UDP OSC transport pack for installs.
- * @details Owns sockets; PODs hold identity / endpoints / show bus. Address form:
- * `/rigkit/<networkId>/master|blackout|color|status|heartbeat` (directed) or
- * `/rigkit/…` without id (broadcast). Bus sends append sender network id as a
- * trailing string arg.
+ * @details Owns sockets; PODs hold identity / endpoints / show bus. Directed
+ * addresses are `/rigkit/` then `networkId` then `master` / `blackout` /
+ * `color` / `status` / `heartbeat`. Broadcast is `/rigkit/` then the leaf, no
+ * id. Bus sends append sender network id as a trailing string arg.
  *
  * After pack setup, product apps call @ref applyCommandLine so network id / ports
  * come from the same CLI everywhere (not only examples).
@@ -63,10 +64,10 @@ class rigOsc : public IPack {
 	/** @brief Send one OSC message using send host/port. */
 	bool send(const std::string& address, const std::vector<osc::OscArg>& args);
 
-	/** @brief `/prefix/<networkId>/<leaf>` — directed at one install. */
+	/** @brief Prefix, then `networkId`, then leaf - directed at one install. */
 	std::string makeAddress(const std::string& leaf) const;
 
-	/** @brief `/prefix/<leaf>` — every listener that shares the prefix. */
+	/** @brief Prefix then leaf - every listener that shares the prefix. */
 	std::string makeBroadcastAddress(const std::string& leaf) const;
 
 	bool listening() const;

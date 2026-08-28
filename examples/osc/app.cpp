@@ -1,14 +1,7 @@
 #include "app.h"
 
-#include <cmath>
-#include <filesystem>
-#include <iostream>
-
-#include <GLFW/glfw3.h>
-#include <spdlog/spdlog.h>
-
-#include "core/RigKitEngine.h"
 #include "core/pack/MPack.h"
+#include "core/RigKitEngine.h"
 #include "core/util/AppPaths.h"
 #include "packs/rigComponent/src/CDrawStyle.h"
 #include "packs/rigComponent/src/CTransform.h"
@@ -23,6 +16,12 @@
 #include "packs/rigOsc/src/COscShowBus.h"
 #include "packs/rigOsc/src/rigOsc.h"
 #include "packs/rigSystems/src/rigSystems.h"
+
+#include <cmath>
+#include <filesystem>
+#include <GLFW/glfw3.h>
+#include <iostream>
+#include <spdlog/spdlog.h>
 
 namespace {
 
@@ -81,7 +80,7 @@ class ShowControlWindow : public rigkit::IWindow {
 			ImGui::TextColored(ImVec4(1.f, 0.4f, 0.3f, 1.f), "%s", m_osc->lastError().c_str());
 		}
 
-		ImGui::TextWrapped("Directed: /rigkit/<id>/…  Broadcast: /rigkit/…  "
+		ImGui::TextWrapped("Directed: /rigkit/<id>/...  Broadcast: /rigkit/...  "
 						   "Bus sends append sender id. Two instances need different "
 						   "--listen-port; point --send-port at the peer.");
 
@@ -139,7 +138,7 @@ void OscHeroApp::parseCommandLineArgs(const rigkit::CommandLineArgs& args) {
 		m_screenshot = true;
 	}
 	if (args.hasFlag("help") || args.hasFlag("h")) {
-		std::cout << "osc — rigOsc example (show-bus lamp)\n\n"
+		std::cout << "osc - rigOsc example (show-bus lamp)\n\n"
 				  << "  --smoke-osc                 Bind UDP, loopback master, exit\n"
 				  << "  --screenshot[=PATH]         Capture framebuffer PNG and exit\n"
 				  << rigkit::rigOsc::commandLineHelp() << "\n"
@@ -163,7 +162,7 @@ void OscHeroApp::applyWindowTitle() {
 }
 
 void OscHeroApp::setup() {
-	spdlog::info("osc — show-bus lamp");
+	spdlog::info("osc - show-bus lamp");
 	m_engine->setClearColor(0.06f, 0.07f, 0.09f, 1.f);
 
 	auto* packs = m_engine->getPackManager();
@@ -180,7 +179,7 @@ void OscHeroApp::setup() {
 	packs->setupAll();
 
 	if (m_osc && !m_osc->applyCommandLine(m_cliArgs)) {
-		spdlog::error("osc: OSC bind failed — {}", m_osc->lastError());
+		spdlog::error("osc: OSC bind failed - {}", m_osc->lastError());
 		m_status = "bind failed";
 	}
 	applyWindowTitle();
@@ -353,7 +352,7 @@ void OscHeroApp::maybeScreenshot(float dt) {
 		fs::create_directories(dest.parent_path(), ec);
 		fs::copy_file(newest, dest, fs::copy_options::overwrite_existing, ec);
 		if (ec) {
-			spdlog::error("screenshot: copy failed — {}", ec.message());
+			spdlog::error("screenshot: copy failed - {}", ec.message());
 			m_screenshot = false;
 			std::exit(1);
 		}

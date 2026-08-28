@@ -1,4 +1,5 @@
 #include "OscCodec.h"
+
 #include <cstring>
 
 namespace rigkit {
@@ -93,7 +94,7 @@ bool parsePacket(const uint8_t* data, size_t len, OscMessage& outMsg) {
 		} else if (tag == 'F') {
 			outMsg.args.push_back(false);
 		} else {
-			// Unsupported tag — stop cleanly
+			// Unsupported tag - stop cleanly
 			break;
 		}
 	}

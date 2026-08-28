@@ -8,8 +8,8 @@ namespace rigkit {
 namespace ecs {
 
 /**
- * @brief Install / app network identity — data only.
- * @details Used in OSC address paths: /rigkit/<networkId>/…
+ * @brief Install / app network identity - data only.
+ * @details Used in OSC address paths: `/rigkit/` then `networkId`.
  */
 struct CNetworkIdentity {
 	std::string networkId = "install";

@@ -2,7 +2,7 @@
 
 ![preview](img/preview.png)
 
-Lamp follows Master / Blackout / Color. Window title shows `[network-id]`. **Broadcast Color / Master** send `/rigkit/…` (no id) so every peer listening on the send target picks it up; **Last from** shows the sender id carried on the message.
+Lamp follows Master / Blackout / Color. Window title shows `[network-id]`. **Broadcast Color / Master** send `/rigkit/...` (no id) so every peer listening on the send target picks it up; **Last from** shows the sender id carried on the message.
 
 ```bash
 cmake -S examples/osc -B examples/osc/build

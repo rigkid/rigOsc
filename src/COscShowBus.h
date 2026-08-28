@@ -9,7 +9,7 @@ namespace ecs {
 
 /**
  * @brief Show-control bus shared between OSC transport and the install app.
- * @details Incoming OSC sets fields + dirty flags. App applies dirty → local state.
+ * @details Incoming OSC sets fields + dirty flags. App applies dirty to local state.
  * App writes heartbeat/status/color; pack may emit them on send.
  */
 struct COscShowBus {

@@ -1,9 +1,8 @@
 #pragma once
 
+#include <entt/entt.hpp>
 #include <memory>
 #include <string>
-
-#include <entt/entt.hpp>
 
 #include "core/U_core.h"
 #include "core/util/CommandLineArgs.h"

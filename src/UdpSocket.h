@@ -9,7 +9,7 @@ namespace osc {
 
 /**
  * @brief Non-blocking UDP socket (Winsock / BSD).
- * @details Handles stay here — never in POD components.
+ * @details Handles stay here - never in POD components.
  */
 class UdpSocket {
   public:
