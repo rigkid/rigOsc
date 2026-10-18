@@ -14,6 +14,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -77,7 +78,11 @@ bool UdpSocket::bind(const std::string& address, int port) {
 		return false;
 	}
 	u_long nonblock = 1;
-	ioctlsocket(s, FIONBIO, &nonblock);
+	if (ioctlsocket(s, FIONBIO, &nonblock) == SOCKET_ERROR) {
+		m_error = "non-blocking socket failed";
+		closesocket(s);
+		return false;
+	}
 	// Exclusive bind - SO_REUSEADDR on Windows UDP lets a second process "bind"
 	// the same port, then loopback / peer datagrams land on the first socket.
 	BOOL exclusive = 1;
@@ -90,7 +95,11 @@ bool UdpSocket::bind(const std::string& address, int port) {
 		return false;
 	}
 	int flags = fcntl(s, F_GETFL, 0);
-	fcntl(s, F_SETFL, flags | O_NONBLOCK);
+	if (flags < 0 || fcntl(s, F_SETFL, flags | O_NONBLOCK) < 0) {
+		m_error = "non-blocking socket failed";
+		::close(s);
+		return false;
+	}
 	// No SO_REUSEADDR - second listener on the same port must fail with EADDRINUSE.
 #endif
 
@@ -177,17 +186,32 @@ size_t UdpSocket::recvFrom(std::vector<uint8_t>& out, std::string* fromHost, int
 	uint8_t buf[2048];
 	sockaddr_in addr{};
 #ifdef _WIN32
+	SOCKET s = static_cast<SOCKET>(m_sock);
+	fd_set readfds;
+	FD_ZERO(&readfds);
+	FD_SET(s, &readfds);
+	timeval tv{};
+	if (::select(0, &readfds, nullptr, nullptr, &tv) <= 0) {
+		return 0;
+	}
 	int addrLen = sizeof(addr);
-	const int n = ::recvfrom(static_cast<SOCKET>(m_sock), reinterpret_cast<char*>(buf), sizeof(buf),
-							 0, reinterpret_cast<sockaddr*>(&addr), &addrLen);
+	const int n = ::recvfrom(s, reinterpret_cast<char*>(buf), sizeof(buf), 0,
+							 reinterpret_cast<sockaddr*>(&addr), &addrLen);
 	if (n == SOCKET_ERROR) {
 		const int err = WSAGetLastError();
-		if (err != WSAEWOULDBLOCK) {
+		if (err != WSAEWOULDBLOCK && err != WSAECONNRESET) {
 			m_error = "recvfrom failed";
 		}
 		return 0;
 	}
 #else
+	fd_set readfds;
+	FD_ZERO(&readfds);
+	FD_SET(m_sock, &readfds);
+	timeval tv{};
+	if (::select(m_sock + 1, &readfds, nullptr, nullptr, &tv) <= 0) {
+		return 0;
+	}
 	socklen_t addrLen = sizeof(addr);
 	const ssize_t n =
 		::recvfrom(m_sock, buf, sizeof(buf), 0, reinterpret_cast<sockaddr*>(&addr), &addrLen);

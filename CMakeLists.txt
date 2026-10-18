@@ -10,7 +10,6 @@ add_library(${PACK_NAME} STATIC
 	src/OscCodec.h
 	src/CNetworkIdentity.h
 	src/COscEndpoint.h
-	src/COscShowBus.h
 )
 target_link_libraries(${PACK_NAME} PUBLIC rigkit)
 if(WIN32)

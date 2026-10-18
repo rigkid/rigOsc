@@ -1,7 +1,7 @@
 #include "app.h"
 
-#include "core/pack/MPack.h"
 #include "core/RigKitEngine.h"
+#include "core/pack/MPack.h"
 #include "core/util/AppPaths.h"
 #include "packs/rigComponent/src/CDrawStyle.h"
 #include "packs/rigComponent/src/CTransform.h"
@@ -13,29 +13,53 @@
 #include "packs/rigImGui/src/rigImGui.h"
 #include "packs/rigOsc/src/CNetworkIdentity.h"
 #include "packs/rigOsc/src/COscEndpoint.h"
-#include "packs/rigOsc/src/COscShowBus.h"
 #include "packs/rigOsc/src/rigOsc.h"
 #include "packs/rigSystems/src/rigSystems.h"
 
+#include <GLFW/glfw3.h>
+#include <algorithm>
 #include <cmath>
 #include <filesystem>
-#include <GLFW/glfw3.h>
 #include <iostream>
 #include <spdlog/spdlog.h>
+#include <variant>
 
 namespace {
+
+bool argFloat(const rigkit::osc::OscArg& a, float& out) {
+	if (const auto* f = std::get_if<float>(&a)) {
+		out = *f;
+		return true;
+	}
+	if (const auto* i = std::get_if<int32_t>(&a)) {
+		out = static_cast<float>(*i);
+		return true;
+	}
+	return false;
+}
+
+bool argBool(const rigkit::osc::OscArg& a, bool& out) {
+	if (const auto* b = std::get_if<bool>(&a)) {
+		out = *b;
+		return true;
+	}
+	if (const auto* i = std::get_if<int32_t>(&a)) {
+		out = *i != 0;
+		return true;
+	}
+	if (const auto* f = std::get_if<float>(&a)) {
+		out = *f >= 0.5f;
+		return true;
+	}
+	return false;
+}
 
 class ShowControlWindow : public rigkit::IWindow {
   public:
 	ShowControlWindow(rigkit::rigOsc* osc, float* master, bool* blackout, float* color,
-					  std::string* status, const int* heartbeat)
-		: IWindow("Show Control", 0),
-		  m_osc(osc),
-		  m_master(master),
-		  m_blackout(blackout),
-		  m_color(color),
-		  m_status(status),
-		  m_heartbeat(heartbeat) {}
+					  std::string* status, const int* heartbeat, const std::string* lastFrom)
+		: IWindow("Show Control", 0), m_osc(osc), m_master(master), m_blackout(blackout),
+		  m_color(color), m_status(status), m_heartbeat(heartbeat), m_lastFrom(lastFrom) {}
 
   protected:
 	void renderContents() override {
@@ -56,8 +80,8 @@ class ShowControlWindow : public rigkit::IWindow {
 		ImGui::Text("Status: %s", m_status ? m_status->c_str() : "?");
 		ImGui::Text("Heartbeat: %d", m_heartbeat ? *m_heartbeat : 0);
 		if (m_osc) {
-			const auto& from = m_osc->showBus().lastFrom;
-			ImGui::Text("Last from: %s", from.empty() ? "-" : from.c_str());
+			const char* from = m_lastFrom && !m_lastFrom->empty() ? m_lastFrom->c_str() : "-";
+			ImGui::Text("Last from: %s", from);
 		}
 
 		if (!m_osc) {
@@ -80,9 +104,10 @@ class ShowControlWindow : public rigkit::IWindow {
 			ImGui::TextColored(ImVec4(1.f, 0.4f, 0.3f, 1.f), "%s", m_osc->lastError().c_str());
 		}
 
-		ImGui::TextWrapped("Directed: /rigkit/<id>/...  Broadcast: /rigkit/...  "
-						   "Bus sends append sender id. Two instances need different "
-						   "--listen-port; point --send-port at the peer.");
+		ImGui::TextWrapped("Directed: %s  Broadcast: %s. "
+						   "This example registers master, blackout, color, status, heartbeat.",
+						   m_osc->makeAddress("master").c_str(),
+						   m_osc->makeBroadcastAddress("master").c_str());
 
 		ImGui::Separator();
 		if (ImGui::Button("Broadcast Color") && m_color) {
@@ -95,8 +120,8 @@ class ShowControlWindow : public rigkit::IWindow {
 		}
 		ImGui::SameLine();
 		if (ImGui::Button("Broadcast Master") && m_master) {
-			const bool ok = m_osc->send(m_osc->makeBroadcastAddress("master"),
-										{*m_master, id.networkId});
+			const bool ok =
+				m_osc->send(m_osc->makeBroadcastAddress("master"), {*m_master, id.networkId});
 			if (m_status) {
 				*m_status = ok ? ("broadcast master as " + id.networkId)
 							   : ("broadcast failed: " + m_osc->lastError());
@@ -114,6 +139,7 @@ class ShowControlWindow : public rigkit::IWindow {
 	float* m_color = nullptr;
 	std::string* m_status = nullptr;
 	const int* m_heartbeat = nullptr;
+	const std::string* m_lastFrom = nullptr;
 };
 
 } // namespace
@@ -197,12 +223,12 @@ void OscHeroApp::setup() {
 		}
 		if (auto* wm = ui->getWindowManager()) {
 			wm->createWindow<ShowControlWindow>(m_osc.get(), &m_master, &m_blackout, m_color,
-												&m_status, &m_heartbeat);
+												&m_status, &m_heartbeat, &m_lastFrom);
 			wm->showWindow("Show Control");
 		}
 	}
 
-	syncShowBus();
+	registerShowBus();
 	applyLamp();
 
 	if (m_smokeOsc) {
@@ -216,40 +242,80 @@ void OscHeroApp::setup() {
 	}
 }
 
-void OscHeroApp::syncShowBus() {
+void OscHeroApp::noteBus(const rigkit::osc::OscRx& rx) {
 	if (!m_osc) {
 		return;
 	}
-	auto& bus = m_osc->showBus();
-	if (bus.masterFromNet) {
-		m_master = bus.master;
-		bus.masterFromNet = false;
-	} else {
-		bus.master = m_master;
+	std::string id = m_osc->busSenderId(rx.msg.address);
+	if (id.empty() && rx.msg.args.size() >= 2) {
+		if (const auto* s = std::get_if<std::string>(&rx.msg.args.back())) {
+			id = *s;
+		}
 	}
-	if (bus.blackoutFromNet) {
-		m_blackout = bus.blackout;
-		bus.blackoutFromNet = false;
-	} else {
-		bus.blackout = m_blackout;
+	if (!id.empty()) {
+		m_lastFrom = id;
 	}
-	if (bus.colorFromNet) {
-		m_color[0] = bus.colorR;
-		m_color[1] = bus.colorG;
-		m_color[2] = bus.colorB;
-		bus.colorFromNet = false;
-	} else {
-		bus.colorR = m_color[0];
-		bus.colorG = m_color[1];
-		bus.colorB = m_color[2];
+}
+
+void OscHeroApp::registerShowBus() {
+	if (!m_osc) {
+		return;
 	}
-	if (bus.statusFromNet) {
-		m_status = bus.status;
-		bus.statusFromNet = false;
-	} else {
-		bus.status = m_status;
+	m_osc->addBusListener("master", [this](const rigkit::osc::OscRx& rx) {
+		float v = 0.f;
+		if (!rx.msg.args.empty() && argFloat(rx.msg.args[0], v)) {
+			m_master = std::clamp(v, 0.f, 1.f);
+			noteBus(rx);
+		}
+	});
+	m_osc->addBusListener("blackout", [this](const rigkit::osc::OscRx& rx) {
+		bool v = false;
+		if (!rx.msg.args.empty() && argBool(rx.msg.args[0], v)) {
+			m_blackout = v;
+			noteBus(rx);
+		}
+	});
+	m_osc->addBusListener("color", [this](const rigkit::osc::OscRx& rx) {
+		if (rx.msg.args.size() < 3) {
+			return;
+		}
+		float r = 0.f, g = 0.f, b = 0.f;
+		if (argFloat(rx.msg.args[0], r) && argFloat(rx.msg.args[1], g) &&
+			argFloat(rx.msg.args[2], b)) {
+			m_color[0] = std::clamp(r, 0.f, 1.f);
+			m_color[1] = std::clamp(g, 0.f, 1.f);
+			m_color[2] = std::clamp(b, 0.f, 1.f);
+			noteBus(rx);
+		}
+	});
+	m_osc->addBusListener("status", [this](const rigkit::osc::OscRx& rx) {
+		if (rx.msg.args.empty()) {
+			return;
+		}
+		if (const auto* s = std::get_if<std::string>(&rx.msg.args[0])) {
+			m_status = *s;
+			noteBus(rx);
+		}
+	});
+	m_osc->addBusListener("heartbeat", [this](const rigkit::osc::OscRx& rx) {
+		// Local counter is ours. A peer tick must not replace it.
+		if (rx.msg.args.empty() || !std::get_if<int32_t>(&rx.msg.args[0])) {
+			return;
+		}
+		noteBus(rx);
+	});
+}
+
+void OscHeroApp::publishShowBus() {
+	if (!m_osc || !m_osc->endpoint().sendEnabled) {
+		return;
 	}
-	bus.heartbeat = m_heartbeat;
+	const std::string& id = m_osc->identity().networkId;
+	m_osc->send(m_osc->makeAddress("heartbeat"), {static_cast<int32_t>(m_heartbeat), id});
+	m_osc->send(m_osc->makeAddress("status"), {m_status, id});
+	m_osc->send(m_osc->makeAddress("master"), {m_master, id});
+	m_osc->send(m_osc->makeAddress("blackout"), {m_blackout, id});
+	m_osc->send(m_osc->makeAddress("color"), {m_color[0], m_color[1], m_color[2], id});
 }
 
 void OscHeroApp::applyLamp() {
@@ -370,8 +436,8 @@ void OscHeroApp::update(float dt) {
 	if (m_heartbeatAccum >= 1.f) {
 		m_heartbeatAccum -= 1.f;
 		++m_heartbeat;
+		publishShowBus();
 	}
-	syncShowBus();
 	applyLamp();
 	maybeScreenshot(dt);
 }

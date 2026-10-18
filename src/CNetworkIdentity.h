@@ -9,7 +9,7 @@ namespace ecs {
 
 /**
  * @brief Install / app network identity - data only.
- * @details Used in OSC address paths: `/rigkit/` then `networkId`.
+ * @details Used in OSC address paths: `/<appName>/` then `networkId`.
  */
 struct CNetworkIdentity {
 	std::string networkId = "install";

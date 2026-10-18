@@ -1,23 +1,40 @@
 #include "rigOsc.h"
 
-#include "core/pack/PackRegistry.h"
-#include "core/RigKitEngine.h"
 #include "CNetworkIdentity.h"
 #include "COscEndpoint.h"
-#include "COscShowBus.h"
 #include "UdpSocket.h"
+#include "core/RigKitEngine.h"
+#include "core/pack/PackRegistry.h"
 
 #include <algorithm>
 #include <chrono>
-#include <cmath>
 #include <spdlog/spdlog.h>
 #include <string>
 #include <thread>
 
 namespace rigkit {
+namespace {
+
+bool oscChar(unsigned char c) {
+	return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' ||
+		   c == '-' || c == '.';
+}
+
+std::string oscSegment(const std::string& raw) {
+	std::string out;
+	out.reserve(raw.size());
+	for (unsigned char c : raw) {
+		if (oscChar(c)) {
+			out.push_back(static_cast<char>(c));
+		}
+	}
+	return out.empty() ? "app" : out;
+}
+
+} // namespace
 
 rigOsc::rigOsc() : IPack("rigOsc") {
-		m_sock = std::make_unique<osc::UdpSocket>();
+	m_sock = std::make_unique<osc::UdpSocket>();
 }
 
 rigOsc::~rigOsc() {
@@ -49,9 +66,6 @@ void rigOsc::ensureEntity() {
 	if (!ecs->hasComponent<ecs::COscEndpoint>(m_entity)) {
 		ecs->addComponent<ecs::COscEndpoint>(m_entity, {});
 	}
-	if (!ecs->hasComponent<ecs::COscShowBus>(m_entity)) {
-		ecs->addComponent<ecs::COscShowBus>(m_entity, {});
-	}
 }
 
 void rigOsc::setup() {
@@ -62,11 +76,13 @@ void rigOsc::setup() {
 	auto* ecs = engine->getECSManager();
 	ecs->registerComponent<ecs::CNetworkIdentity>("NetworkIdentity", true);
 	ecs->registerComponent<ecs::COscEndpoint>("OscEndpoint", true);
-	ecs->registerComponent<ecs::COscShowBus>("OscShowBus", true);
 	ensureEntity();
+	if (endpoint().addressPrefix.empty()) {
+		endpoint().addressPrefix = busPrefix();
+	}
 	applyEndpoint();
-	spdlog::info("[rigOsc] setup - id='{}' listen {}:{}", identity().networkId,
-				 identity().bindAddress, endpoint().listenPort);
+	spdlog::info("[rigOsc] setup - id='{}' bus {} listen {}:{}", identity().networkId,
+				 endpoint().addressPrefix, identity().bindAddress, endpoint().listenPort);
 }
 
 void rigOsc::cleanup() {
@@ -75,6 +91,9 @@ void rigOsc::cleanup() {
 	}
 	m_boundPort = -1;
 	m_boundAddress.clear();
+	m_bindFailed = false;
+	m_bindFailPort = -1;
+	m_bindFailAddress.clear();
 }
 
 ecs::CNetworkIdentity& rigOsc::identity() {
@@ -87,21 +106,17 @@ ecs::COscEndpoint& rigOsc::endpoint() {
 	return getEngine()->getECSManager()->getComponent<ecs::COscEndpoint>(m_entity);
 }
 
-ecs::COscShowBus& rigOsc::showBus() {
-	ensureEntity();
-	return getEngine()->getECSManager()->getComponent<ecs::COscShowBus>(m_entity);
-}
-
 bool rigOsc::listening() const {
 	return m_sock && m_sock->isOpen();
 }
 
-bool rigOsc::applyEndpoint() {
+bool rigOsc::applyEndpoint(bool force) {
 	ensureEntity();
-	m_lastError.clear();
 	auto& ep = endpoint();
 	auto& id = identity();
 	if (!ep.listenEnabled) {
+		m_bindFailed = false;
+		m_lastError.clear();
 		// Drop a listen bind; keep an ephemeral send socket if present.
 		if (m_sock->isOpen() && m_boundPort == ep.listenPort) {
 			m_sock->close();
@@ -113,11 +128,23 @@ bool rigOsc::applyEndpoint() {
 	if (m_sock->isOpen() && m_boundPort == ep.listenPort && m_boundAddress == id.bindAddress) {
 		return true;
 	}
-	if (!m_sock->bind(id.bindAddress, ep.listenPort)) {
-		m_lastError = m_sock->lastError();
-		spdlog::error("[rigOsc] bind {}:{} failed - {}", id.bindAddress, ep.listenPort, m_lastError);
+	if (!force && m_bindFailed && m_bindFailPort == ep.listenPort &&
+		m_bindFailAddress == id.bindAddress) {
 		return false;
 	}
+	m_lastError.clear();
+	if (!m_sock->bind(id.bindAddress, ep.listenPort)) {
+		m_lastError = m_sock->lastError();
+		m_bindFailed = true;
+		m_bindFailPort = ep.listenPort;
+		m_bindFailAddress = id.bindAddress;
+		spdlog::error("[rigOsc] bind {}:{} failed - {}", id.bindAddress, ep.listenPort,
+					  m_lastError);
+		return false;
+	}
+	m_bindFailed = false;
+	m_bindFailPort = -1;
+	m_bindFailAddress.clear();
 	// Port 0 to kernel picks ephemeral; record the real bound port.
 	m_boundPort = m_sock->port();
 	if (ep.listenPort == 0) {
@@ -161,153 +188,75 @@ bool rigOsc::applyCommandLine(const CommandLineArgs& args) {
 
 	const bool ok = applyEndpoint();
 	spdlog::info("[rigOsc] id='{}' listen {}:{} send {}:{} listening={}", id.networkId,
-				 id.bindAddress, ep.listenPort, ep.sendHost, ep.sendPort, listening() ? "yes" : "no");
+				 id.bindAddress, ep.listenPort, ep.sendHost, ep.sendPort,
+				 listening() ? "yes" : "no");
 	return ok;
+}
+
+std::string rigOsc::busPrefix() const {
+	auto* self = const_cast<rigOsc*>(this);
+	std::string raw = self->endpoint().addressPrefix;
+	if (raw.empty()) {
+		if (auto* engine = getEngine()) {
+			if (const auto* app = engine->getApp()) {
+				raw = app->getAppName();
+			}
+		}
+	}
+	while (!raw.empty() && raw.front() == '/') {
+		raw.erase(raw.begin());
+	}
+	const auto slash = raw.find('/');
+	if (slash != std::string::npos) {
+		raw.resize(slash);
+	}
+	return "/" + oscSegment(raw);
 }
 
 std::string rigOsc::makeAddress(const std::string& leaf) const {
 	auto* self = const_cast<rigOsc*>(this);
-	const auto& ep = self->endpoint();
-	const auto& id = self->identity();
-	std::string prefix = ep.addressPrefix.empty() ? "/rigkit" : ep.addressPrefix;
-	if (prefix.back() == '/') {
-		prefix.pop_back();
-	}
-	return prefix + "/" + id.networkId + "/" + leaf;
+	return busPrefix() + "/" + oscSegment(self->identity().networkId) + "/" + oscSegment(leaf);
 }
 
 std::string rigOsc::makeBroadcastAddress(const std::string& leaf) const {
-	auto* self = const_cast<rigOsc*>(this);
-	const auto& ep = self->endpoint();
-	std::string prefix = ep.addressPrefix.empty() ? "/rigkit" : ep.addressPrefix;
-	if (prefix.back() == '/') {
-		prefix.pop_back();
-	}
-	return prefix + "/" + leaf;
+	return busPrefix() + "/" + oscSegment(leaf);
 }
 
-std::string rigOsc::leafAddress(const std::string& full) const {
-	auto* self = const_cast<rigOsc*>(this);
-	const auto& ep = self->endpoint();
-	const auto& id = self->identity();
-	std::string prefix = ep.addressPrefix.empty() ? "/rigkit" : ep.addressPrefix;
-	if (prefix.back() == '/') {
-		prefix.pop_back();
+std::string rigOsc::busSenderId(const std::string& address) const {
+	const std::string prefix = busPrefix() + "/";
+	if (address.size() <= prefix.size() || address.compare(0, prefix.size(), prefix) != 0) {
+		return {};
 	}
-	const std::string withId = prefix + "/" + id.networkId + "/";
-	const std::string bare = prefix + "/";
-	if (full.rfind(withId, 0) == 0) {
-		return full.substr(withId.size());
+	const std::string rest = address.substr(prefix.size());
+	const auto slash = rest.find('/');
+	if (slash == std::string::npos || slash == 0) {
+		return {};
 	}
-	// Broadcast: /prefix/<leaf> with no network id segment (leaf must not contain '/').
-	if (full.rfind(bare, 0) == 0) {
-		const std::string rest = full.substr(bare.size());
-		if (rest.find('/') == std::string::npos) {
-			return rest;
-		}
+	if (rest.find('/', slash + 1) != std::string::npos) {
+		return {};
 	}
-	return {};
+	return rest.substr(0, slash);
 }
 
-void rigOsc::noteSender(const osc::OscMessage& msg) {
-	// Trailing string arg is the sender network id (apps append it on bus sends).
-	if (msg.args.size() < 2) {
-		return;
+bool rigOsc::busLeafMatches(const std::string& leaf, const std::string& address) const {
+	const std::string seg = oscSegment(leaf);
+	if (address == busPrefix() + "/" + seg) {
+		return true;
 	}
-	if (const auto* s = std::get_if<std::string>(&msg.args.back())) {
-		if (!s->empty()) {
-			showBus().lastFrom = *s;
-		}
-	}
-}
-
-void rigOsc::handleMessage(const osc::OscMessage& msg) {
-	const std::string leaf = leafAddress(msg.address);
-	if (leaf.empty()) {
-		return;
-	}
-	auto& bus = showBus();
-	auto asFloat = [&](float& dst) -> bool {
-		if (msg.args.empty()) {
-			return false;
-		}
-		if (const auto* f = std::get_if<float>(&msg.args[0])) {
-			dst = *f;
-			return true;
-		}
-		if (const auto* i = std::get_if<int32_t>(&msg.args[0])) {
-			dst = static_cast<float>(*i);
-			return true;
-		}
+	const std::string prefix = busPrefix() + "/";
+	const std::string tail = "/" + seg;
+	if (address.size() <= prefix.size() + tail.size()) {
 		return false;
-	};
-	auto asBool = [&](bool& dst) -> bool {
-		if (msg.args.empty()) {
-			return false;
-		}
-		if (const auto* b = std::get_if<bool>(&msg.args[0])) {
-			dst = *b;
-			return true;
-		}
-		if (const auto* i = std::get_if<int32_t>(&msg.args[0])) {
-			dst = (*i) != 0;
-			return true;
-		}
-		if (const auto* f = std::get_if<float>(&msg.args[0])) {
-			dst = (*f) >= 0.5f;
-			return true;
-		}
-		return false;
-	};
-
-	if (leaf == "master") {
-		if (asFloat(bus.master)) {
-			bus.master = std::clamp(bus.master, 0.f, 1.f);
-			bus.masterFromNet = true;
-			noteSender(msg);
-		}
-	} else if (leaf == "blackout") {
-		if (asBool(bus.blackout)) {
-			bus.blackoutFromNet = true;
-			noteSender(msg);
-		}
-	} else if (leaf == "color") {
-		if (msg.args.size() >= 3) {
-			auto take = [&](size_t i, float& dst) -> bool {
-				if (const auto* f = std::get_if<float>(&msg.args[i])) {
-					dst = *f;
-					return true;
-				}
-				if (const auto* iv = std::get_if<int32_t>(&msg.args[i])) {
-					dst = static_cast<float>(*iv);
-					return true;
-				}
-				return false;
-			};
-			if (take(0, bus.colorR) && take(1, bus.colorG) && take(2, bus.colorB)) {
-				bus.colorR = std::clamp(bus.colorR, 0.f, 1.f);
-				bus.colorG = std::clamp(bus.colorG, 0.f, 1.f);
-				bus.colorB = std::clamp(bus.colorB, 0.f, 1.f);
-				bus.colorFromNet = true;
-				noteSender(msg);
-			}
-		}
-	} else if (leaf == "status") {
-		if (!msg.args.empty()) {
-			if (const auto* s = std::get_if<std::string>(&msg.args[0])) {
-				bus.status = *s;
-				bus.statusFromNet = true;
-				noteSender(msg);
-			}
-		}
-	} else if (leaf == "heartbeat") {
-		if (!msg.args.empty()) {
-			if (const auto* i = std::get_if<int32_t>(&msg.args[0])) {
-				bus.heartbeat = *i;
-				noteSender(msg);
-			}
-		}
 	}
+	if (address.compare(0, prefix.size(), prefix) != 0) {
+		return false;
+	}
+	if (address.compare(address.size() - tail.size(), tail.size(), tail) != 0) {
+		return false;
+	}
+	const std::string mid =
+		address.substr(prefix.size(), address.size() - prefix.size() - tail.size());
+	return !mid.empty() && mid.find('/') == std::string::npos;
 }
 
 bool rigOsc::send(const std::string& address, const std::vector<osc::OscArg>& args) {
@@ -316,8 +265,60 @@ bool rigOsc::send(const std::string& address, const std::vector<osc::OscArg>& ar
 	if (!ep.sendEnabled) {
 		return false;
 	}
+	return encodeAndSend(ep.sendHost, ep.sendPort, address, args);
+}
+
+int rigOsc::addListener(const std::string& pattern, OscListener fn) {
+	if (pattern.empty() || !fn) {
+		return 0;
+	}
+	Listener row;
+	row.id = m_nextListenerId++;
+	row.pattern = pattern;
+	row.fn = std::move(fn);
+	const int id = row.id;
+	m_listeners.push_back(std::move(row));
+	return id;
+}
+
+int rigOsc::addBusListener(const std::string& leaf, OscListener fn) {
+	if (leaf.empty() || !fn) {
+		return 0;
+	}
+	Listener row;
+	row.id = m_nextListenerId++;
+	row.leaf = oscSegment(leaf);
+	row.fn = std::move(fn);
+	const int id = row.id;
+	m_listeners.push_back(std::move(row));
+	return id;
+}
+
+void rigOsc::removeListener(int id) {
+	if (id <= 0) {
+		return;
+	}
+	m_listeners.erase(std::remove_if(m_listeners.begin(), m_listeners.end(),
+									 [id](const Listener& row) { return row.id == id; }),
+					  m_listeners.end());
+}
+
+void rigOsc::dispatch(const osc::OscRx& rx) {
+	for (Listener& row : m_listeners) {
+		if (!row.fn) {
+			continue;
+		}
+		const bool hit = !row.leaf.empty() ? busLeafMatches(row.leaf, rx.msg.address)
+										   : osc::matchAddress(row.pattern, rx.msg.address);
+		if (hit) {
+			row.fn(rx);
+		}
+	}
+}
+
+bool rigOsc::encodeAndSend(const std::string& host, int port, const std::string& address,
+						   const std::vector<osc::OscArg>& args) {
 	if (!m_sock->isOpen()) {
-		// Send-only: bind ephemeral UDP port.
 		if (!m_sock->bind(identity().bindAddress, 0)) {
 			m_lastError = m_sock->lastError();
 			return false;
@@ -325,57 +326,51 @@ bool rigOsc::send(const std::string& address, const std::vector<osc::OscArg>& ar
 		m_boundPort = m_sock->port();
 		m_boundAddress = identity().bindAddress;
 	}
-	std::vector<uint8_t> pkt;
-	if (!osc::encodeMessage(address, args, pkt)) {
+	if (!osc::encodeMessage(address, args, m_txBuf)) {
 		m_lastError = "encode failed";
 		return false;
 	}
-	if (!m_sock->sendTo(ep.sendHost, ep.sendPort, pkt.data(), pkt.size())) {
+	if (!m_sock->sendTo(host, port, m_txBuf.data(), m_txBuf.size())) {
 		m_lastError = m_sock->lastError();
 		return false;
 	}
 	return true;
 }
 
-void rigOsc::maybeSendHeartbeat() {
-	auto& ep = endpoint();
-	if (!ep.sendEnabled) {
-		return;
-	}
-	auto& bus = showBus();
-	if (bus.heartbeat == m_lastSentHeartbeat) {
-		return;
-	}
-	m_lastSentHeartbeat = bus.heartbeat;
-	const std::string& id = identity().networkId;
-	send(makeAddress("heartbeat"), {static_cast<int32_t>(bus.heartbeat), id});
-	send(makeAddress("status"), {bus.status, id});
-	send(makeAddress("master"), {bus.master, id});
-	send(makeAddress("blackout"), {bus.blackout, id});
-	send(makeAddress("color"), {bus.colorR, bus.colorG, bus.colorB, id});
+bool rigOsc::sendTo(const std::string& host, int port, const std::string& address,
+					const std::vector<osc::OscArg>& args) {
+	ensureEntity();
+	return encodeAndSend(host, port, address, args);
 }
 
 void rigOsc::update(float deltaTime) {
+	(void)deltaTime;
 	ensureEntity();
 	applyEndpoint();
 
 	if (m_sock->isOpen()) {
 		for (int i = 0; i < 32; ++i) {
-			std::vector<uint8_t> pkt;
-			if (m_sock->recvFrom(pkt) == 0) {
+			std::string fromHost;
+			int fromPort = 0;
+			m_rxBuf.clear();
+			if (m_sock->recvFrom(m_rxBuf, &fromHost, &fromPort) == 0) {
 				break;
 			}
-			osc::OscMessage msg;
-			if (osc::parsePacket(pkt.data(), pkt.size(), msg)) {
-				handleMessage(msg);
+			std::vector<osc::OscMessage> msgs;
+			if (!osc::parsePacket(m_rxBuf.data(), m_rxBuf.size(), msgs) || msgs.empty()) {
+				++m_ignoredPackets;
+				continue;
+			}
+			for (osc::OscMessage& msg : msgs) {
+				osc::OscRx rx;
+				rx.msg = std::move(msg);
+				rx.fromHost = fromHost;
+				rx.fromPort = fromPort;
+				m_lastRx = rx;
+				m_haveRx = true;
+				dispatch(rx);
 			}
 		}
-	}
-
-	m_sendAccum += deltaTime;
-	if (m_sendAccum >= 1.f) {
-		m_sendAccum = 0.f;
-		maybeSendHeartbeat();
 	}
 }
 
@@ -414,11 +409,44 @@ bool rigOsc::smokeLoopback() {
 	const int port = m_boundPort;
 	ep.sendPort = port;
 
-	auto& bus = showBus();
-	auto waitMaster = [&](float expect) -> bool {
+	if (ep.addressPrefix.empty()) {
+		ep.addressPrefix = busPrefix();
+	}
+	const std::string directed = makeAddress("ping");
+	const std::string broadcast = makeBroadcastAddress("ping");
+	const std::string idSeg = oscSegment(id.networkId);
+	if (directed != busPrefix() + "/" + idSeg + "/ping" || broadcast != busPrefix() + "/ping" ||
+		busSenderId(directed) != idSeg || !busSenderId(broadcast).empty()) {
+		m_lastError = "smokeLoopback: bus address shape";
+		spdlog::error("[rigOsc] {}", m_lastError);
+		restore();
+		return false;
+	}
+
+	float got = -1.f;
+	std::string sawFrom;
+	int hits = 0;
+	const int busId = addBusListener("ping", [&](const osc::OscRx& rx) {
+		if (rx.msg.args.empty()) {
+			return;
+		}
+		if (const auto* f = std::get_if<float>(&rx.msg.args[0])) {
+			got = *f;
+			sawFrom = busSenderId(rx.msg.address);
+			++hits;
+		}
+	});
+	if (busId <= 0) {
+		m_lastError = "smokeLoopback: addBusListener failed";
+		spdlog::error("[rigOsc] {}", m_lastError);
+		restore();
+		return false;
+	}
+
+	auto waitGot = [&](float expect, const std::string& from) -> bool {
 		for (int i = 0; i < 20; ++i) {
 			update(0.f);
-			if (bus.masterFromNet && std::abs(bus.master - expect) < 0.001f) {
+			if (hits > 0 && got == expect && sawFrom == from) {
 				return true;
 			}
 			std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -426,57 +454,158 @@ bool rigOsc::smokeLoopback() {
 		return false;
 	};
 
-	bus.master = 0.f;
-	bus.masterFromNet = false;
-	bus.lastFrom.clear();
 	std::vector<uint8_t> pkt;
-	if (!osc::encodeMessage(makeAddress("master"), {0.42f, std::string(identity().networkId)},
-							pkt)) {
+	if (!osc::encodeMessage(directed, {0.42f}, pkt)) {
 		m_lastError = "encode smoke failed";
+		removeListener(busId);
 		restore();
 		return false;
 	}
 	if (!m_sock->sendTo("127.0.0.1", port, pkt.data(), pkt.size())) {
 		m_lastError = m_sock->lastError().empty() ? "sendTo failed" : m_sock->lastError();
+		removeListener(busId);
 		restore();
 		return false;
 	}
-	if (!waitMaster(0.42f)) {
+	if (!waitGot(0.42f, idSeg)) {
 		m_lastError = "smokeLoopback: no packet received (directed)";
 		spdlog::error("[rigOsc] {}", m_lastError);
+		removeListener(busId);
 		restore();
 		return false;
 	}
 
-	bus.master = 0.f;
-	bus.masterFromNet = false;
-	bus.lastFrom.clear();
+	hits = 0;
+	got = -1.f;
+	sawFrom.clear();
 	pkt.clear();
-	if (!osc::encodeMessage(makeBroadcastAddress("master"),
-							{0.55f, std::string(identity().networkId)}, pkt)) {
+	if (!osc::encodeMessage(broadcast, {0.55f}, pkt)) {
 		m_lastError = "encode broadcast smoke failed";
+		removeListener(busId);
 		restore();
 		return false;
 	}
 	if (!m_sock->sendTo("127.0.0.1", port, pkt.data(), pkt.size())) {
 		m_lastError = m_sock->lastError().empty() ? "sendTo failed" : m_sock->lastError();
+		removeListener(busId);
 		restore();
 		return false;
 	}
-	if (!waitMaster(0.55f)) {
+	if (!waitGot(0.55f, {})) {
 		m_lastError = "smokeLoopback: no packet received (broadcast)";
 		spdlog::error("[rigOsc] {}", m_lastError);
-		restore();
-		return false;
-	}
-	if (bus.lastFrom != identity().networkId) {
-		m_lastError = "smokeLoopback: sender id not recorded";
-		spdlog::error("[rigOsc] {}", m_lastError);
+		removeListener(busId);
 		restore();
 		return false;
 	}
 
-	spdlog::info("[rigOsc] smokeLoopback OK (directed+broadcast port={})", port);
+	hits = 0;
+	got = -1.f;
+	sawFrom.clear();
+	pkt.clear();
+	const std::string other = busPrefix() + "/other/ping";
+	if (!osc::encodeMessage(other, {0.77f}, pkt) ||
+		!m_sock->sendTo("127.0.0.1", port, pkt.data(), pkt.size()) || !waitGot(0.77f, "other")) {
+		m_lastError = "smokeLoopback: other network id not delivered";
+		spdlog::error("[rigOsc] {}", m_lastError);
+		removeListener(busId);
+		restore();
+		return false;
+	}
+	removeListener(busId);
+
+	auto failCodec = [&](const char* why) {
+		m_lastError = why;
+		spdlog::error("[rigOsc] {}", m_lastError);
+		restore();
+		return false;
+	};
+	if (!osc::matchAddress("/bus/mix/*", "/bus/mix/level") ||
+		osc::matchAddress("/bus/mix/*", "/bus/mix/a/b") ||
+		!osc::matchAddress("/bus/**", "/bus/mix/level") || !osc::matchAddress("/bus/**", "/bus") ||
+		!osc::matchAddress("/bus/ch/?/set", "/bus/ch/a/set") ||
+		!osc::matchAddress("/foo[abc]", "/foob") || !osc::matchAddress("/foo[!abc]", "/food") ||
+		!osc::matchAddress("/{a,b}/x", "/a/x") || osc::matchAddress("/{a,b}/x", "/c/x")) {
+		return failCodec("smokeLoopback: matchAddress failed");
+	}
+
+	{
+		const std::vector<uint8_t> blob{1, 2, 3, 4, 5};
+		pkt.clear();
+		if (!osc::encodeMessage("/blob", {blob}, pkt)) {
+			return failCodec("smokeLoopback: encode blob failed");
+		}
+		osc::OscMessage got;
+		if (!osc::parsePacket(pkt.data(), pkt.size(), got)) {
+			return failCodec("smokeLoopback: parse blob failed");
+		}
+		const auto* gotBlob = std::get_if<std::vector<uint8_t>>(&got.args[0]);
+		if (got.address != "/blob" || !gotBlob || *gotBlob != blob) {
+			return failCodec("smokeLoopback: blob roundtrip failed");
+		}
+	}
+
+	{
+		osc::OscMessage a;
+		a.address = "/bundle/a";
+		a.args.push_back(1);
+		osc::OscMessage b;
+		b.address = "/bundle/b";
+		b.args.push_back(2.f);
+		pkt.clear();
+		if (!osc::encodeBundle({a, b}, pkt)) {
+			return failCodec("smokeLoopback: encode bundle failed");
+		}
+		std::vector<osc::OscMessage> got;
+		if (!osc::parsePacket(pkt.data(), pkt.size(), got) || got.size() != 2 ||
+			got[0].address != "/bundle/a" || got[1].address != "/bundle/b") {
+			return failCodec("smokeLoopback: parse bundle failed");
+		}
+	}
+
+	hits = 0;
+	const int lid = addListener("/rigosc/*", [&](const osc::OscRx& rx) {
+		if (rx.msg.address == "/rigosc/ping") {
+			++hits;
+		}
+	});
+	if (lid <= 0 || !sendTo("127.0.0.1", port, "/rigosc/ping", {true})) {
+		removeListener(lid);
+		return failCodec("smokeLoopback: listener send failed");
+	}
+	bool heard = false;
+	for (int i = 0; i < 20; ++i) {
+		update(0.f);
+		if (hits > 0) {
+			heard = true;
+			break;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
+	}
+	removeListener(lid);
+	if (!heard) {
+		return failCodec("smokeLoopback: listener did not fire");
+	}
+
+	const int ignoredBefore = m_ignoredPackets;
+	const uint8_t garbage[] = {0x01, 0x02, 0x03, 0x04, 0xff, 0x00, 0x11, 0x22};
+	if (!m_sock->sendTo("127.0.0.1", port, garbage, sizeof(garbage))) {
+		return failCodec("smokeLoopback: garbage send failed");
+	}
+	bool ignored = false;
+	for (int i = 0; i < 20; ++i) {
+		update(0.f);
+		if (m_ignoredPackets > ignoredBefore) {
+			ignored = true;
+			break;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
+	}
+	if (!ignored) {
+		return failCodec("smokeLoopback: malformed packet not ignored");
+	}
+
+	spdlog::info("[rigOsc] smokeLoopback OK (directed+broadcast+bundle+listen port={})", port);
 	restore();
 	return true;
 }

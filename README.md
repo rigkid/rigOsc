@@ -2,12 +2,15 @@
 
 ![preview](examples/osc/img/preview.png)
 
-UDP OSC transport plus network identity / show-bus PODs for installs.
+UDP OSC transport. Show-bus addresses are `/<appName>/<networkId>/<leaf>` and broadcast `/<appName>/<leaf>`. The app registers each leaf.
 
 - Bind / listen / send (`UdpSocket` + `OscCodec`)
-- `CNetworkIdentity`, `COscEndpoint`, `COscShowBus` - data on the pack
+- OSC 1.0 messages and bundles; typed args `i` / `f` / `s` / `T`/`F` / blob `b`
+- Address-pattern listeners (`?` `*` `[]` `{}`, plus pack `**` across `/`)
+- `CNetworkIdentity`, `COscEndpoint` - data on the pack
 - Bind failures surface in `lastError()` (no fake open)
 - Shared CLI for any app: `applyCommandLine` + `commandLineHelp`
+- `addBusListener` routes a leaf the app names. The pack does not ship leaf names.
 
 ## CLI
 
@@ -29,7 +32,7 @@ Accepts `--key=value` or `--key value`. Logs `id=... listen ... send ... listeni
 
 Paste `rigOsc::commandLineHelp()` into your app’s `--help`.
 
-Addresses: `/rigkit/` then `networkId` then `master` / `blackout` / `color` / `status` / `heartbeat` (directed), and `/rigkit/` then the leaf with no id (broadcast). Bus sends append the sender `networkId` as a trailing string arg. `color` is three floats then optional sender id.
+Addresses: `/<appName>/<networkId>/<leaf>` directed, `/<appName>/<leaf>` broadcast. `oscHost` and this example register `master`, `blackout`, `color`, `status`, and send `heartbeat`. Other apps register their own leaves, or only use `addListener`.
 
 Host reference with author/show + multi-instance: RigKit `examples/oscHost`.
 

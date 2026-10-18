@@ -6,12 +6,13 @@
 
 #include "core/U_core.h"
 #include "core/util/CommandLineArgs.h"
+#include "packs/rigOsc/src/OscCodec.h"
 
 namespace rigkit {
 class rigOsc;
 }
 
-/// Example for rigOsc: lamp follows Master / Blackout / Color on the show bus.
+/// Example for rigOsc: lamp follows leaves this app registers on `/<appName>/<networkId>/`.
 class OscHeroApp : public rigkit::IApp {
   public:
 	OscHeroApp();
@@ -23,7 +24,9 @@ class OscHeroApp : public rigkit::IApp {
 	void draw() override;
 
   private:
-	void syncShowBus();
+	void registerShowBus();
+	void publishShowBus();
+	void noteBus(const rigkit::osc::OscRx& rx);
 	void applyLamp();
 	void applyWindowTitle();
 	bool runSmoke();
@@ -46,4 +49,5 @@ class OscHeroApp : public rigkit::IApp {
 	float m_screenshotWait = 0.f;
 	std::string m_screenshotPath;
 	std::string m_status = "idle";
+	std::string m_lastFrom;
 };

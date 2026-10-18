@@ -5,7 +5,7 @@
   "version": "0.1.0",
   "author": "Rigkid",
   "license": "MIT Rigkid Contributors",
-  "description": "UDP OSC transport + network identity / show bus PODs for installs.",
+  "description": "UDP OSC transport. Apps register show-bus leaves under /<appName>/<networkId>/.",
   "dependencies": [],
   "include_paths": [
     "src"

@@ -2,7 +2,7 @@
 
 ![preview](img/preview.png)
 
-Lamp follows Master / Blackout / Color. Window title shows `[network-id]`. **Broadcast Color / Master** send `/rigkit/...` (no id) so every peer listening on the send target picks it up; **Last from** shows the sender id carried on the message.
+Lamp follows Master / Blackout / Color. This example registers those leaves, plus status and heartbeat, on `/<appName>/<networkId>/`. Window title shows `[network-id]`. **Broadcast Color / Master** send `/<appName>/color` and `/<appName>/master` so every peer on the send target picks them up. **Last from** is the network id in a directed address.
 
 ```bash
 cmake -S examples/osc -B examples/osc/build
