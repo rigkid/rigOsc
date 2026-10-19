@@ -2,10 +2,14 @@
 
 ![preview](examples/osc/img/preview.png)
 
-UDP OSC transport. Show-bus addresses are `/<appName>/<networkId>/<leaf>` and broadcast `/<appName>/<leaf>`. The app registers each leaf.
+OSC transport. Show-bus addresses are `/<appName>/<networkId>/<leaf>` and broadcast `/<appName>/<leaf>`. The app registers each leaf.
 
-- Bind / listen / send (`UdpSocket` + `OscCodec`)
-- OSC 1.0 messages and bundles; typed args `i` / `f` / `s` / `T`/`F` / blob `b`
+- UDP listen / send (`UdpSocket` + `OscCodec`). Exclusive unicast bind. Broadcast sends allowed
+- TCP opt-in on the same dispatch path. Default framing is a 4-byte big-endian size. `streamFraming` Slip uses SLIP (`0xC0` / `0xDB`). Peer count and packet size are the host's
+- One socket thread receives and sends. `update` delivers listeners on the SUDE thread
+- IPv4 multicast opt-in (`multicastGroup`, TTL). Joining uses `SO_REUSEADDR` so another listener can share that port. Empty group keeps the exclusive unicast bind
+- OSC 1.0 / 1.1 args `i` `h` `f` `d` `s` `S` `b` `t` `c` `r` `m` `T`/`F` `N` `I` and arrays `[` `]`
+- Bundles, including a future timetag (held until due)
 - Address-pattern listeners (`?` `*` `[]` `{}`, plus pack `**` across `/`)
 - `CNetworkIdentity`, `COscEndpoint` - data on the pack
 - Bind failures surface in `lastError()` (no fake open)
@@ -27,6 +31,9 @@ m_osc->applyCommandLine(args);
 | `--listen-port` | `COscEndpoint::listenPort` |
 | `--send-host` | `COscEndpoint::sendHost` |
 | `--send-port` | `COscEndpoint::sendPort` |
+| `--tcp` / `--tcp-port` | `tcpListen`, `tcpPort` (0 = listen port) |
+| `--slip` | `streamFraming` SLIP (default is the size prefix) |
+| `--multicast` / `--multicast-ttl` | `multicastGroup`, `multicastTtl` |
 
 Accepts `--key=value` or `--key value`. Logs `id=... listen ... send ... listening=...`.
 

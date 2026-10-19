@@ -6,6 +6,8 @@ add_library(${PACK_NAME} STATIC
 	src/rigOsc.h
 	src/UdpSocket.cpp
 	src/UdpSocket.h
+	src/TcpSocket.cpp
+	src/TcpSocket.h
 	src/OscCodec.cpp
 	src/OscCodec.h
 	src/CNetworkIdentity.h
@@ -18,4 +20,4 @@ endif()
 target_include_directories(${PACK_NAME} PUBLIC
 	$<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/src>
 )
-message(STATUS "Configured pack: ${PACK_NAME} (UDP OSC)")
+message(STATUS "Configured pack: ${PACK_NAME} (OSC)")

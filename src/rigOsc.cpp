@@ -2,15 +2,19 @@
 
 #include "CNetworkIdentity.h"
 #include "COscEndpoint.h"
+#include "TcpSocket.h"
 #include "UdpSocket.h"
 #include "core/RigKitEngine.h"
 #include "core/pack/PackRegistry.h"
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <spdlog/spdlog.h>
 #include <string>
 #include <thread>
+#include <utility>
 
 namespace rigkit {
 namespace {
@@ -33,8 +37,42 @@ std::string oscSegment(const std::string& raw) {
 
 } // namespace
 
+struct rigOsc::Net {
+	struct Cmd {
+		enum Kind { Apply, Connect, Send } kind = Send;
+		NetConfig cfg;
+		bool force = false;
+		uint64_t token = 0;
+		std::string host;
+		int port = 0;
+		std::vector<uint8_t> bytes;
+		bool udpOnly = false;
+	};
+
+	std::mutex mu;
+	std::condition_variable cv;
+	std::thread thread;
+	std::atomic<bool> stop{false};
+	std::vector<Cmd> cmds;
+	std::vector<osc::OscRx> inbound;
+	osc::UdpSocket wake;
+	osc::UdpSocket knock;
+	int wakePort = 0;
+	uint64_t nextToken = 1;
+	uint64_t doneToken = 0;
+	bool doneOk = false;
+	std::string doneError;
+	int doneListenPort = 0;
+	bool doneRewriteListen = false;
+	std::string lastError;
+	NetConfig netCfg;
+};
+
 rigOsc::rigOsc() : IPack("rigOsc") {
 	m_sock = std::make_unique<osc::UdpSocket>();
+	m_tcp = std::make_unique<osc::TcpPort>();
+	m_io = std::make_unique<Net>();
+	startNet();
 }
 
 rigOsc::~rigOsc() {
@@ -86,14 +124,32 @@ void rigOsc::setup() {
 }
 
 void rigOsc::cleanup() {
+	stopNet();
+	m_liveValid = false;
+	m_udpOpen = false;
+	m_tcpOpen = false;
 	if (m_sock) {
 		m_sock->close();
 	}
+	if (m_tcp) {
+		m_tcp->close();
+	}
 	m_boundPort = -1;
 	m_boundAddress.clear();
+	m_boundGroup.clear();
+	m_tcpPort = -1;
+	m_tcpAddress.clear();
+	m_due.clear();
 	m_bindFailed = false;
 	m_bindFailPort = -1;
 	m_bindFailAddress.clear();
+	m_bindFailGroup.clear();
+	m_tcpBindFailed = false;
+	m_tcpFailPort = -1;
+	m_tcpFailAddress.clear();
+	m_dialFailed = false;
+	m_dialHost.clear();
+	m_dialPort = -1;
 }
 
 ecs::CNetworkIdentity& rigOsc::identity() {
@@ -107,60 +163,219 @@ ecs::COscEndpoint& rigOsc::endpoint() {
 }
 
 bool rigOsc::listening() const {
-	return m_sock && m_sock->isOpen();
+	return m_udpOpen.load();
+}
+
+bool rigOsc::tcpListening() const {
+	return m_tcpOpen.load();
+}
+
+std::string rigOsc::lastError() const {
+	if (!m_io) {
+		return m_lastError;
+	}
+	std::lock_guard lock(m_io->mu);
+	if (!m_io->lastError.empty()) {
+		return m_io->lastError;
+	}
+	return m_lastError;
+}
+
+rigOsc::NetConfig rigOsc::currentConfig() {
+	ensureEntity();
+	auto& ep = endpoint();
+	auto& id = identity();
+	NetConfig cfg;
+	cfg.listenEnabled = ep.listenEnabled;
+	cfg.listenPort = ep.listenPort;
+	cfg.bindAddress = id.bindAddress;
+	cfg.multicastGroup = ep.multicastGroup;
+	cfg.multicastTtl = ep.multicastTtl;
+	cfg.tcpListen = ep.tcpListen;
+	cfg.tcpPort = ep.tcpPort;
+	cfg.tcpConnect = ep.tcpConnect;
+	cfg.sendEnabled = ep.sendEnabled;
+	cfg.sendHost = ep.sendHost;
+	cfg.sendPort = ep.sendPort;
+	cfg.streamFraming = ep.streamFraming;
+	return cfg;
 }
 
 bool rigOsc::applyEndpoint(bool force) {
 	ensureEntity();
 	auto& ep = endpoint();
-	auto& id = identity();
-	if (!ep.listenEnabled) {
+	if (ep.multicastTtl < 0) {
+		ep.multicastTtl = 0;
+	}
+	if (ep.multicastTtl > 255) {
+		ep.multicastTtl = 255;
+	}
+	if (ep.streamFraming != osc::TcpPort::kFramingSlip) {
+		ep.streamFraming = osc::TcpPort::kFramingSize;
+	}
+	const NetConfig cfg = currentConfig();
+	if (!force && m_liveValid && cfg == m_liveCfg) {
+		return m_liveOk;
+	}
+	std::string err;
+	int listenPort = cfg.listenPort;
+	bool rewrite = false;
+	const bool ok = submitApply(cfg, force, err, listenPort, rewrite);
+	NetConfig live = cfg;
+	if (rewrite) {
+		ep.listenPort = listenPort;
+		live.listenPort = listenPort;
+	}
+	if (err == "osc thread did not answer") {
+		m_liveValid = false;
+		m_lastError = err;
+		return false;
+	}
+	m_liveCfg = live;
+	m_liveValid = true;
+	m_liveOk = ok;
+	m_lastError = err;
+	if (m_io) {
+		std::lock_guard lock(m_io->mu);
+		m_io->lastError.clear();
+	}
+	return ok;
+}
+
+bool rigOsc::applyOnNet(const NetConfig& cfg, bool force, std::string& err, int& listenPort,
+						bool& rewriteListen) {
+	err.clear();
+	rewriteListen = false;
+	listenPort = cfg.listenPort;
+	if (m_io) {
+		m_io->netCfg = cfg;
+	}
+	if (!cfg.listenEnabled) {
 		m_bindFailed = false;
-		m_lastError.clear();
 		// Drop a listen bind; keep an ephemeral send socket if present.
-		if (m_sock->isOpen() && m_boundPort == ep.listenPort) {
+		if (m_sock->isOpen() && m_boundPort.load() == cfg.listenPort) {
 			m_sock->close();
 			m_boundPort = -1;
 			m_boundAddress.clear();
+			m_boundGroup.clear();
 		}
+		m_udpOpen = false;
+		if (m_tcp) {
+			m_tcp->closeListen();
+		}
+		m_tcpPort = -1;
+		m_tcpOpen = false;
+		m_tcpAddress.clear();
+		m_tcpBindFailed = false;
+		if (m_io) {
+			m_io->netCfg = cfg;
+		}
+		maintainTcpConnect(cfg);
 		return true;
 	}
-	if (m_sock->isOpen() && m_boundPort == ep.listenPort && m_boundAddress == id.bindAddress) {
-		return true;
+
+	const bool udpSame = m_sock->isOpen() && m_boundPort.load() == cfg.listenPort &&
+						 m_boundAddress == cfg.bindAddress && m_boundGroup == cfg.multicastGroup &&
+						 m_boundTtl == cfg.multicastTtl;
+	if (!udpSame) {
+		if (!force && m_bindFailed && m_bindFailPort == cfg.listenPort &&
+			m_bindFailAddress == cfg.bindAddress && m_bindFailGroup == cfg.multicastGroup) {
+			err = m_sock->lastError().empty() ? "bind failed" : m_sock->lastError();
+			m_udpOpen = false;
+			return false;
+		}
+		if (!m_sock->bind(cfg.bindAddress, cfg.listenPort, cfg.multicastGroup, cfg.multicastTtl)) {
+			err = m_sock->lastError();
+			m_bindFailed = true;
+			m_bindFailPort = cfg.listenPort;
+			m_bindFailAddress = cfg.bindAddress;
+			m_bindFailGroup = cfg.multicastGroup;
+			m_udpOpen = false;
+			spdlog::error("[rigOsc] bind {}:{} failed - {}", cfg.bindAddress, cfg.listenPort, err);
+			return false;
+		}
+		m_bindFailed = false;
+		m_bindFailPort = -1;
+		m_bindFailAddress.clear();
+		m_bindFailGroup.clear();
+		// Port 0 to kernel picks ephemeral; record the real bound port.
+		m_boundPort = m_sock->port();
+		if (cfg.listenPort == 0) {
+			rewriteListen = true;
+			listenPort = m_boundPort.load();
+		}
+		m_boundAddress = cfg.bindAddress;
+		m_boundGroup = cfg.multicastGroup;
+		m_boundTtl = cfg.multicastTtl;
+		spdlog::info("[rigOsc] listening on {}:{}", cfg.bindAddress, m_boundPort.load());
+		if (!cfg.multicastGroup.empty()) {
+			spdlog::info("[rigOsc] multicast {} ttl {}", cfg.multicastGroup, cfg.multicastTtl);
+		}
 	}
-	if (!force && m_bindFailed && m_bindFailPort == ep.listenPort &&
-		m_bindFailAddress == id.bindAddress) {
-		return false;
+	m_udpOpen = true;
+
+	const int udpPort = m_boundPort.load();
+	const int tcpWant = cfg.tcpListen ? (cfg.tcpPort > 0 ? cfg.tcpPort : udpPort) : -1;
+	const int framing = cfg.streamFraming == osc::TcpPort::kFramingSlip
+							? osc::TcpPort::kFramingSlip
+							: osc::TcpPort::kFramingSize;
+	const bool tcpSame = tcpWant < 0 ? (m_tcpPort.load() < 0)
+									 : (m_tcp->isListening() && m_tcpPort.load() == tcpWant &&
+										m_tcpAddress == cfg.bindAddress && m_tcpFraming == framing);
+	if (!tcpSame) {
+		if (tcpWant < 0) {
+			m_tcp->closeListen();
+			m_tcpPort = -1;
+			m_tcpOpen = false;
+			m_tcpAddress.clear();
+			m_tcpBindFailed = false;
+		} else if (!force && m_tcpBindFailed && m_tcpFailPort == tcpWant &&
+				   m_tcpFailAddress == cfg.bindAddress) {
+			err = m_tcp->lastError().empty() ? "tcp bind failed" : m_tcp->lastError();
+			return false;
+		} else if (!m_tcp->listen(cfg.bindAddress, tcpWant)) {
+			err = m_tcp->lastError();
+			m_tcpBindFailed = true;
+			m_tcpFailPort = tcpWant;
+			m_tcpFailAddress = cfg.bindAddress;
+			m_tcpOpen = false;
+			spdlog::error("[rigOsc] tcp {}:{} failed - {}", cfg.bindAddress, tcpWant, err);
+			return false;
+		} else {
+			m_tcpBindFailed = false;
+			m_tcpFailPort = -1;
+			m_tcpFailAddress.clear();
+			m_tcpPort = m_tcp->port();
+			m_tcpOpen = true;
+			m_tcpAddress = cfg.bindAddress;
+			m_tcpFraming = framing;
+			spdlog::info("[rigOsc] tcp {}:{} framing {}", cfg.bindAddress, m_tcpPort.load(),
+						 m_tcpFraming == osc::TcpPort::kFramingSlip ? "slip" : "size");
+		}
+	} else {
+		m_tcpOpen = tcpWant >= 0;
 	}
-	m_lastError.clear();
-	if (!m_sock->bind(id.bindAddress, ep.listenPort)) {
-		m_lastError = m_sock->lastError();
-		m_bindFailed = true;
-		m_bindFailPort = ep.listenPort;
-		m_bindFailAddress = id.bindAddress;
-		spdlog::error("[rigOsc] bind {}:{} failed - {}", id.bindAddress, ep.listenPort,
-					  m_lastError);
-		return false;
+	if (m_io) {
+		m_io->netCfg = cfg;
+		if (rewriteListen) {
+			m_io->netCfg.listenPort = listenPort;
+		}
 	}
-	m_bindFailed = false;
-	m_bindFailPort = -1;
-	m_bindFailAddress.clear();
-	// Port 0 to kernel picks ephemeral; record the real bound port.
-	m_boundPort = m_sock->port();
-	if (ep.listenPort == 0) {
-		ep.listenPort = m_boundPort;
-	}
-	m_boundAddress = id.bindAddress;
-	spdlog::info("[rigOsc] listening on {}:{}", id.bindAddress, m_boundPort);
+	maintainTcpConnect(cfg);
 	return true;
 }
 
 const char* rigOsc::commandLineHelp() {
 	return "  --network-id=ID / --id=ID   OSC network id (default: install)\n"
 		   "  --listen-port=N             UDP listen port (default: 8000)\n"
-		   "  --send-host=HOST            UDP send host (default: 127.0.0.1)\n"
-		   "  --send-port=N               UDP send port (default: 8001)\n"
-		   "  --bind-address=ADDR         Listen bind (default: 0.0.0.0)";
+		   "  --send-host=HOST            Send host (default: 127.0.0.1)\n"
+		   "  --send-port=N               Send port (default: 8001)\n"
+		   "  --bind-address=ADDR         Listen bind (default: 0.0.0.0)\n"
+		   "  --tcp                       TCP listen (port = listen port)\n"
+		   "  --tcp-port=N                TCP listen port (0 = listen port)\n"
+		   "  --slip                      TCP framing SLIP (default: size prefix)\n"
+		   "  --multicast=GROUP           IPv4 multicast group to join\n"
+		   "  --multicast-ttl=N           Multicast TTL (default: 1)";
 }
 
 bool rigOsc::applyCommandLine(const CommandLineArgs& args) {
@@ -184,6 +399,22 @@ bool rigOsc::applyCommandLine(const CommandLineArgs& args) {
 	}
 	if (auto v = args.getValue("send-port")) {
 		ep.sendPort = std::stoi(*v);
+	}
+	if (args.hasFlag("tcp")) {
+		ep.tcpListen = true;
+	}
+	if (auto v = args.getValue("tcp-port")) {
+		ep.tcpListen = true;
+		ep.tcpPort = std::stoi(*v);
+	}
+	if (args.hasFlag("slip")) {
+		ep.streamFraming = osc::TcpPort::kFramingSlip;
+	}
+	if (auto v = args.getValue("multicast")) {
+		ep.multicastGroup = *v;
+	}
+	if (auto v = args.getValue("multicast-ttl")) {
+		ep.multicastTtl = std::stoi(*v);
 	}
 
 	const bool ok = applyEndpoint();
@@ -303,6 +534,40 @@ void rigOsc::removeListener(int id) {
 					  m_listeners.end());
 }
 
+void rigOsc::deliver(osc::OscRx rx) {
+	m_lastRx = rx;
+	m_haveRx = true;
+	dispatch(rx);
+}
+
+void rigOsc::offer(osc::OscRx rx) {
+	const osc::OscTimetag now = osc::timetagNow();
+	if (rx.msg.time.isImmediate() || osc::timetagCompare(rx.msg.time, now) <= 0) {
+		deliver(std::move(rx));
+		return;
+	}
+	m_due.push_back(std::move(rx));
+}
+
+void rigOsc::flushDue() {
+	if (m_due.empty()) {
+		return;
+	}
+	const osc::OscTimetag now = osc::timetagNow();
+	size_t keep = 0;
+	for (size_t i = 0; i < m_due.size(); ++i) {
+		if (osc::timetagCompare(m_due[i].msg.time, now) <= 0) {
+			deliver(std::move(m_due[i]));
+		} else {
+			if (keep != i) {
+				m_due[keep] = std::move(m_due[i]);
+			}
+			++keep;
+		}
+	}
+	m_due.resize(keep);
+}
+
 void rigOsc::dispatch(const osc::OscRx& rx) {
 	for (Listener& row : m_listeners) {
 		if (!row.fn) {
@@ -318,23 +583,41 @@ void rigOsc::dispatch(const osc::OscRx& rx) {
 
 bool rigOsc::encodeAndSend(const std::string& host, int port, const std::string& address,
 						   const std::vector<osc::OscArg>& args) {
-	if (!m_sock->isOpen()) {
-		if (!m_sock->bind(identity().bindAddress, 0)) {
-			m_lastError = m_sock->lastError();
-			return false;
-		}
-		m_boundPort = m_sock->port();
-		m_boundAddress = identity().bindAddress;
-	}
-	if (!osc::encodeMessage(address, args, m_txBuf)) {
+	std::vector<uint8_t> bytes;
+	if (!osc::encodeMessage(address, args, bytes)) {
 		m_lastError = "encode failed";
 		return false;
 	}
-	if (!m_sock->sendTo(host, port, m_txBuf.data(), m_txBuf.size())) {
-		m_lastError = m_sock->lastError();
+	enqueueSend(host, port, std::move(bytes), false);
+	return true;
+}
+
+bool rigOsc::connectTcp(const std::string& host, int port) {
+	if (host.empty() || port <= 0 || port > 65535) {
+		m_lastError = "tcp connect failed";
 		return false;
 	}
+	enqueueConnect(host, port);
 	return true;
+}
+
+void rigOsc::maintainTcpConnect(const NetConfig& cfg) {
+	if (!cfg.tcpConnect || !cfg.sendEnabled || cfg.sendHost.empty() || cfg.sendPort <= 0) {
+		return;
+	}
+	if (m_tcp->hasPeer(cfg.sendHost, cfg.sendPort)) {
+		return;
+	}
+	if (m_dialFailed && m_dialHost == cfg.sendHost && m_dialPort == cfg.sendPort) {
+		return;
+	}
+	if (!m_tcp->connect(cfg.sendHost, cfg.sendPort)) {
+		m_dialFailed = true;
+		m_dialHost = cfg.sendHost;
+		m_dialPort = cfg.sendPort;
+		spdlog::error("[rigOsc] tcp dial {}:{} failed - {}", cfg.sendHost, cfg.sendPort,
+					  m_tcp->lastError());
+	}
 }
 
 bool rigOsc::sendTo(const std::string& host, int port, const std::string& address,
@@ -347,9 +630,139 @@ void rigOsc::update(float deltaTime) {
 	(void)deltaTime;
 	ensureEntity();
 	applyEndpoint();
+	flushDue();
+	if (!m_io) {
+		return;
+	}
+	std::vector<osc::OscRx> inbound;
+	{
+		std::lock_guard lock(m_io->mu);
+		inbound.swap(m_io->inbound);
+	}
+	for (osc::OscRx& rx : inbound) {
+		offer(std::move(rx));
+	}
+}
 
-	if (m_sock->isOpen()) {
-		for (int i = 0; i < 32; ++i) {
+void rigOsc::startNet() {
+	if (!m_io || m_io->thread.joinable()) {
+		return;
+	}
+	m_io->stop = false;
+	if (m_io->wake.bind("127.0.0.1", 0)) {
+		m_io->wakePort = m_io->wake.port();
+		m_io->knock.bind("127.0.0.1", 0);
+	}
+	m_io->thread = std::thread([this] { netLoop(); });
+}
+
+void rigOsc::stopNet() {
+	if (!m_io || !m_io->thread.joinable()) {
+		return;
+	}
+	m_io->stop = true;
+	wakeNet();
+	m_io->cv.notify_all();
+	m_io->thread.join();
+}
+
+void rigOsc::wakeNet() {
+	if (!m_io || !m_io->knock.isOpen() || m_io->wakePort <= 0) {
+		return;
+	}
+	const uint8_t byte = 1;
+	m_io->knock.sendTo("127.0.0.1", m_io->wakePort, &byte, 1);
+}
+
+bool rigOsc::submitApply(const NetConfig& cfg, bool force, std::string& err, int& listenPort,
+						 bool& rewriteListen) {
+	if (!m_io || !m_io->thread.joinable()) {
+		err = "osc thread is not running";
+		return false;
+	}
+	uint64_t token = 0;
+	{
+		std::lock_guard lock(m_io->mu);
+		token = m_io->nextToken++;
+		Net::Cmd cmd;
+		cmd.kind = Net::Cmd::Apply;
+		cmd.cfg = cfg;
+		cmd.force = force;
+		cmd.token = token;
+		m_io->cmds.push_back(std::move(cmd));
+	}
+	wakeNet();
+	std::unique_lock lock(m_io->mu);
+	const bool answered = m_io->cv.wait_for(lock, std::chrono::seconds(2), [&] {
+		return m_io->doneToken == token || m_io->stop.load();
+	});
+	if (!answered || m_io->doneToken != token) {
+		err = "osc thread did not answer";
+		return false;
+	}
+	err = m_io->doneError;
+	listenPort = m_io->doneListenPort;
+	rewriteListen = m_io->doneRewriteListen;
+	return m_io->doneOk;
+}
+
+void rigOsc::enqueueSend(std::string host, int port, std::vector<uint8_t> bytes, bool udpOnly) {
+	if (!m_io) {
+		return;
+	}
+	Net::Cmd cmd;
+	cmd.kind = Net::Cmd::Send;
+	cmd.host = std::move(host);
+	cmd.port = port;
+	cmd.bytes = std::move(bytes);
+	cmd.udpOnly = udpOnly;
+	{
+		std::lock_guard lock(m_io->mu);
+		m_io->cmds.push_back(std::move(cmd));
+	}
+	wakeNet();
+}
+
+void rigOsc::enqueueConnect(std::string host, int port) {
+	if (!m_io) {
+		return;
+	}
+	Net::Cmd cmd;
+	cmd.kind = Net::Cmd::Connect;
+	cmd.host = std::move(host);
+	cmd.port = port;
+	{
+		std::lock_guard lock(m_io->mu);
+		m_io->cmds.push_back(std::move(cmd));
+	}
+	wakeNet();
+}
+
+bool rigOsc::sendDatagram(const std::string& host, int port, const uint8_t* data, size_t len) {
+	if (!data || len == 0 || port <= 0) {
+		return false;
+	}
+	enqueueSend(host, port, std::vector<uint8_t>(data, data + len), true);
+	return true;
+}
+
+void rigOsc::drainSockets() {
+	std::vector<osc::OscRx> got;
+	auto take = [&](std::vector<osc::OscMessage>& msgs, const std::string& host, int port) {
+		if (msgs.empty()) {
+			m_ignoredPackets.fetch_add(1);
+			return;
+		}
+		for (osc::OscMessage& msg : msgs) {
+			osc::OscRx rx;
+			rx.msg = std::move(msg);
+			rx.fromHost = host;
+			rx.fromPort = port;
+			got.push_back(std::move(rx));
+		}
+	};
+	if (m_sock && m_sock->isOpen()) {
+		while (true) {
 			std::string fromHost;
 			int fromPort = 0;
 			m_rxBuf.clear();
@@ -357,18 +770,120 @@ void rigOsc::update(float deltaTime) {
 				break;
 			}
 			std::vector<osc::OscMessage> msgs;
-			if (!osc::parsePacket(m_rxBuf.data(), m_rxBuf.size(), msgs) || msgs.empty()) {
-				++m_ignoredPackets;
+			if (!osc::parsePacket(m_rxBuf.data(), m_rxBuf.size(), msgs)) {
+				m_ignoredPackets.fetch_add(1);
 				continue;
 			}
-			for (osc::OscMessage& msg : msgs) {
-				osc::OscRx rx;
-				rx.msg = std::move(msg);
-				rx.fromHost = fromHost;
-				rx.fromPort = fromPort;
-				m_lastRx = rx;
-				m_haveRx = true;
-				dispatch(rx);
+			take(msgs, fromHost, fromPort);
+		}
+	}
+	if (m_tcp) {
+		const int before = m_tcp->discarded();
+		const int framing = m_io && m_io->netCfg.streamFraming == osc::TcpPort::kFramingSlip
+								? osc::TcpPort::kFramingSlip
+								: osc::TcpPort::kFramingSize;
+		std::vector<osc::TcpPacket> pkts;
+		m_tcp->poll(framing, pkts);
+		m_ignoredPackets.fetch_add(m_tcp->discarded() - before);
+		for (osc::TcpPacket& pkt : pkts) {
+			std::vector<osc::OscMessage> msgs;
+			if (!osc::parsePacket(pkt.bytes.data(), pkt.bytes.size(), msgs)) {
+				m_ignoredPackets.fetch_add(1);
+				continue;
+			}
+			take(msgs, pkt.fromHost, pkt.fromPort);
+		}
+	}
+	if (!got.empty() && m_io) {
+		std::lock_guard lock(m_io->mu);
+		m_io->inbound.insert(m_io->inbound.end(), std::make_move_iterator(got.begin()),
+							 std::make_move_iterator(got.end()));
+	}
+}
+
+void rigOsc::netLoop() {
+	while (m_io && !m_io->stop.load()) {
+		std::vector<Net::Cmd> cmds;
+		{
+			std::lock_guard lock(m_io->mu);
+			cmds.swap(m_io->cmds);
+		}
+		for (Net::Cmd& cmd : cmds) {
+			if (cmd.kind == Net::Cmd::Apply) {
+				std::string err;
+				int port = 0;
+				bool rewrite = false;
+				const bool ok = applyOnNet(cmd.cfg, cmd.force, err, port, rewrite);
+				{
+					std::lock_guard lock(m_io->mu);
+					m_io->doneToken = cmd.token;
+					m_io->doneOk = ok;
+					m_io->doneError = std::move(err);
+					m_io->doneListenPort = port;
+					m_io->doneRewriteListen = rewrite;
+				}
+				m_io->cv.notify_all();
+			} else if (cmd.kind == Net::Cmd::Connect) {
+				m_dialFailed = false;
+				if (!m_tcp->connect(cmd.host, cmd.port)) {
+					spdlog::error("[rigOsc] tcp connect {}:{} failed - {}", cmd.host, cmd.port,
+								  m_tcp->lastError());
+				}
+			} else if (!cmd.bytes.empty()) {
+				if (!m_sock->isOpen()) {
+					const std::string bindOn = m_io->netCfg.bindAddress.empty()
+												   ? std::string("0.0.0.0")
+												   : m_io->netCfg.bindAddress;
+					if (!m_sock->bind(bindOn, 0)) {
+						spdlog::error("[rigOsc] send bind failed - {}", m_sock->lastError());
+						continue;
+					}
+					m_boundPort = m_sock->port();
+					m_boundAddress = bindOn;
+				}
+				const int framing = m_io->netCfg.streamFraming == osc::TcpPort::kFramingSlip
+										? osc::TcpPort::kFramingSlip
+										: osc::TcpPort::kFramingSize;
+				if (!cmd.udpOnly && m_tcp->hasPeer(cmd.host, cmd.port)) {
+					if (!m_tcp->sendTo(cmd.host, cmd.port, cmd.bytes.data(), cmd.bytes.size(),
+									   framing)) {
+						spdlog::error("[rigOsc] tcp send failed - {}", m_tcp->lastError());
+					}
+				} else if (!m_sock->sendTo(cmd.host, cmd.port, cmd.bytes.data(),
+										   cmd.bytes.size())) {
+					spdlog::error("[rigOsc] udp send failed - {}", m_sock->lastError());
+				}
+			}
+		}
+		if (m_io->netCfg.tcpConnect) {
+			maintainTcpConnect(m_io->netCfg);
+		}
+		drainSockets();
+		if (m_io->stop.load()) {
+			break;
+		}
+		bool more = false;
+		{
+			std::lock_guard lock(m_io->mu);
+			more = !m_io->cmds.empty();
+		}
+		if (more) {
+			continue;
+		}
+		std::vector<osc::SockInterest> wait;
+		if (m_io->wake.isOpen()) {
+			wait.push_back(osc::SockInterest{m_io->wake.handle(), true, false});
+		}
+		if (m_sock->isOpen()) {
+			wait.push_back(osc::SockInterest{m_sock->handle(), true, false});
+		}
+		if (m_tcp) {
+			m_tcp->interests(wait);
+		}
+		osc::waitSockets(wait, 200);
+		if (m_io->wake.isOpen()) {
+			std::vector<uint8_t> dump;
+			while (m_io->wake.recvFrom(dump) > 0) {
 			}
 		}
 	}
@@ -386,6 +901,12 @@ bool rigOsc::smokeLoopback() {
 	const int savedSendPort = ep.sendPort;
 	const std::string savedSendHost = ep.sendHost;
 	const std::string savedBind = id.bindAddress;
+	const bool savedTcp = ep.tcpListen;
+	const bool savedTcpConnect = ep.tcpConnect;
+	const int savedTcpPort = ep.tcpPort;
+	const int savedFraming = ep.streamFraming;
+	const std::string savedGroup = ep.multicastGroup;
+	const int savedTtl = ep.multicastTtl;
 
 	auto restore = [&]() {
 		ep.listenEnabled = savedListenEn;
@@ -394,13 +915,25 @@ bool rigOsc::smokeLoopback() {
 		ep.sendPort = savedSendPort;
 		ep.sendHost = savedSendHost;
 		id.bindAddress = savedBind;
-		applyEndpoint();
+		ep.tcpListen = savedTcp;
+		ep.tcpConnect = savedTcpConnect;
+		ep.tcpPort = savedTcpPort;
+		ep.streamFraming = savedFraming;
+		ep.multicastGroup = savedGroup;
+		ep.multicastTtl = savedTtl;
+		applyEndpoint(true);
 	};
 
 	ep.listenEnabled = true;
 	ep.sendEnabled = true;
 	ep.sendHost = "127.0.0.1";
 	id.bindAddress = "127.0.0.1";
+	ep.tcpListen = false;
+	ep.tcpConnect = false;
+	ep.tcpPort = 0;
+	ep.streamFraming = osc::TcpPort::kFramingSize;
+	ep.multicastGroup.clear();
+	ep.multicastTtl = 1;
 	ep.listenPort = 0; // ephemeral - never collide with another instance on 8000
 	if (!applyEndpoint()) {
 		restore();
@@ -461,7 +994,7 @@ bool rigOsc::smokeLoopback() {
 		restore();
 		return false;
 	}
-	if (!m_sock->sendTo("127.0.0.1", port, pkt.data(), pkt.size())) {
+	if (!sendDatagram("127.0.0.1", port, pkt.data(), pkt.size())) {
 		m_lastError = m_sock->lastError().empty() ? "sendTo failed" : m_sock->lastError();
 		removeListener(busId);
 		restore();
@@ -485,7 +1018,7 @@ bool rigOsc::smokeLoopback() {
 		restore();
 		return false;
 	}
-	if (!m_sock->sendTo("127.0.0.1", port, pkt.data(), pkt.size())) {
+	if (!sendDatagram("127.0.0.1", port, pkt.data(), pkt.size())) {
 		m_lastError = m_sock->lastError().empty() ? "sendTo failed" : m_sock->lastError();
 		removeListener(busId);
 		restore();
@@ -505,7 +1038,7 @@ bool rigOsc::smokeLoopback() {
 	pkt.clear();
 	const std::string other = busPrefix() + "/other/ping";
 	if (!osc::encodeMessage(other, {0.77f}, pkt) ||
-		!m_sock->sendTo("127.0.0.1", port, pkt.data(), pkt.size()) || !waitGot(0.77f, "other")) {
+		!sendDatagram("127.0.0.1", port, pkt.data(), pkt.size()) || !waitGot(0.77f, "other")) {
 		m_lastError = "smokeLoopback: other network id not delivered";
 		spdlog::error("[rigOsc] {}", m_lastError);
 		removeListener(busId);
@@ -558,8 +1091,143 @@ bool rigOsc::smokeLoopback() {
 		}
 		std::vector<osc::OscMessage> got;
 		if (!osc::parsePacket(pkt.data(), pkt.size(), got) || got.size() != 2 ||
-			got[0].address != "/bundle/a" || got[1].address != "/bundle/b") {
+			got[0].address != "/bundle/a" || got[1].address != "/bundle/b" ||
+			!got[0].time.isImmediate()) {
 			return failCodec("smokeLoopback: parse bundle failed");
+		}
+	}
+
+	{
+		const int64_t wide = int64_t(1) << 40;
+		const double precise = 1.5;
+		osc::OscTimetag tag = osc::OscTimetag::fromBits(0x0000000100000002ull);
+		pkt.clear();
+		if (!osc::encodeMessage("/wide", {wide, precise, osc::OscNil{}, osc::OscSymbol{"sym"}, tag},
+								pkt)) {
+			return failCodec("smokeLoopback: encode wide failed");
+		}
+		osc::OscMessage wideGot;
+		if (!osc::parsePacket(pkt.data(), pkt.size(), wideGot) || wideGot.args.size() != 5) {
+			return failCodec("smokeLoopback: parse wide failed");
+		}
+		const auto* hi = std::get_if<int64_t>(&wideGot.args[0]);
+		const auto* dd = std::get_if<double>(&wideGot.args[1]);
+		const auto* sym = std::get_if<osc::OscSymbol>(&wideGot.args[3]);
+		const auto* tt = std::get_if<osc::OscTimetag>(&wideGot.args[4]);
+		if (!hi || *hi != wide || !dd || *dd != precise ||
+			!std::holds_alternative<osc::OscNil>(wideGot.args[2]) || !sym || sym->value != "sym" ||
+			!tt || tt->bits() != tag.bits()) {
+			return failCodec("smokeLoopback: wide roundtrip failed");
+		}
+	}
+
+	{
+		osc::OscArray inner;
+		osc::items(inner).push_back(int32_t{7});
+		osc::items(inner).push_back(8.f);
+		osc::OscArray outer;
+		osc::items(outer).push_back(std::move(inner));
+		osc::items(outer).push_back(int32_t{9});
+		pkt.clear();
+		if (!osc::encodeMessage("/arr", {outer}, pkt)) {
+			return failCodec("smokeLoopback: encode array failed");
+		}
+		osc::OscMessage arrGot;
+		if (!osc::parsePacket(pkt.data(), pkt.size(), arrGot) || arrGot.args.size() != 1) {
+			return failCodec("smokeLoopback: parse array failed");
+		}
+		const auto* gotOuter = std::get_if<osc::OscArray>(&arrGot.args[0]);
+		if (!gotOuter || osc::items(*gotOuter).size() != 2) {
+			return failCodec("smokeLoopback: array shape failed");
+		}
+		const auto* gotInner = std::get_if<osc::OscArray>(&osc::items(*gotOuter)[0]);
+		const auto* gotNine = std::get_if<int32_t>(&osc::items(*gotOuter)[1]);
+		const auto* gotSeven = gotInner ? std::get_if<int32_t>(&osc::items(*gotInner)[0]) : nullptr;
+		const auto* gotEight = gotInner ? std::get_if<float>(&osc::items(*gotInner)[1]) : nullptr;
+		if (!gotInner || osc::items(*gotInner).size() != 2 || !gotSeven || *gotSeven != 7 ||
+			!gotEight || *gotEight != 8.f || !gotNine || *gotNine != 9) {
+			return failCodec("smokeLoopback: array roundtrip failed");
+		}
+	}
+
+	auto tcpRoundtrip = [&](int framing, const char* label) -> bool {
+		ep.tcpListen = true;
+		ep.tcpPort = 0;
+		ep.tcpConnect = false;
+		ep.streamFraming = framing;
+		if (!applyEndpoint(true) || tcpBoundPort() <= 0) {
+			m_lastError = std::string("smokeLoopback: tcp bind failed (") + label + ")";
+			spdlog::error("[rigOsc] {}", m_lastError);
+			restore();
+			return false;
+		}
+		const int tcpPort = tcpBoundPort();
+		if (!connectTcp("127.0.0.1", tcpPort)) {
+			m_lastError = std::string("smokeLoopback: tcp connect failed (") + label + ")";
+			spdlog::error("[rigOsc] {}", m_lastError);
+			restore();
+			return false;
+		}
+		int tcpHits = 0;
+		const int tcpId = addListener("/rigosc/tcp", [&](const osc::OscRx& rx) {
+			if (rx.msg.args.size() == 1 && rx.fromPort > 0) {
+				++tcpHits;
+			}
+		});
+		bool heardTcp = false;
+		for (int i = 0; i < 40; ++i) {
+			sendTo("127.0.0.1", tcpPort, "/rigosc/tcp", {int32_t{1}});
+			update(0.f);
+			if (tcpHits > 0) {
+				heardTcp = true;
+				break;
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(5));
+		}
+		removeListener(tcpId);
+		ep.tcpListen = false;
+		applyEndpoint(true);
+		if (!heardTcp) {
+			m_lastError = std::string("smokeLoopback: tcp loopback failed (") + label + ")";
+			spdlog::error("[rigOsc] {}", m_lastError);
+			restore();
+			return false;
+		}
+		return true;
+	};
+	if (!tcpRoundtrip(osc::TcpPort::kFramingSize, "size") ||
+		!tcpRoundtrip(osc::TcpPort::kFramingSlip, "slip")) {
+		return false;
+	}
+
+	{
+		osc::OscMessage later;
+		later.address = "/rigosc/later";
+		later.args.push_back(1);
+		const uint64_t dueBits =
+			osc::timetagNow().bits() + static_cast<uint64_t>(0.12 * 4294967296.0);
+		pkt.clear();
+		if (!osc::encodeBundle({later}, osc::OscTimetag::fromBits(dueBits), pkt)) {
+			return failCodec("smokeLoopback: encode timed bundle failed");
+		}
+		int late = 0;
+		const int lateId = addListener("/rigosc/later", [&](const osc::OscRx&) { ++late; });
+		if (lateId <= 0 || !sendDatagram("127.0.0.1", port, pkt.data(), pkt.size())) {
+			removeListener(lateId);
+			return failCodec("smokeLoopback: timed bundle send failed");
+		}
+		for (int i = 0; i < 4; ++i) {
+			update(0.f);
+		}
+		if (late != 0) {
+			removeListener(lateId);
+			return failCodec("smokeLoopback: future bundle fired early");
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(200));
+		update(0.f);
+		removeListener(lateId);
+		if (late != 1) {
+			return failCodec("smokeLoopback: future bundle did not fire");
 		}
 	}
 
@@ -589,7 +1257,7 @@ bool rigOsc::smokeLoopback() {
 
 	const int ignoredBefore = m_ignoredPackets;
 	const uint8_t garbage[] = {0x01, 0x02, 0x03, 0x04, 0xff, 0x00, 0x11, 0x22};
-	if (!m_sock->sendTo("127.0.0.1", port, garbage, sizeof(garbage))) {
+	if (!sendDatagram("127.0.0.1", port, garbage, sizeof(garbage))) {
 		return failCodec("smokeLoopback: garbage send failed");
 	}
 	bool ignored = false;
@@ -605,7 +1273,36 @@ bool rigOsc::smokeLoopback() {
 		return failCodec("smokeLoopback: malformed packet not ignored");
 	}
 
-	spdlog::info("[rigOsc] smokeLoopback OK (directed+broadcast+bundle+listen port={})", port);
+	ep.multicastGroup = "239.255.42.99";
+	ep.multicastTtl = 1;
+	ep.tcpListen = false;
+	ep.tcpConnect = false;
+	id.bindAddress = "0.0.0.0";
+	ep.listenPort = 0;
+	if (!applyEndpoint(true)) {
+		return failCodec("smokeLoopback: multicast bind failed");
+	}
+	const int mport = m_boundPort;
+	int mhits = 0;
+	const int mid = addListener("/rigosc/mcast", [&](const osc::OscRx&) { ++mhits; });
+	bool heardM = false;
+	for (int i = 0; i < 20; ++i) {
+		if (!sendTo("239.255.42.99", mport, "/rigosc/mcast", {int32_t{1}})) {
+			break;
+		}
+		update(0.f);
+		if (mhits > 0) {
+			heardM = true;
+			break;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
+	}
+	removeListener(mid);
+	if (!heardM) {
+		return failCodec("smokeLoopback: multicast loopback failed");
+	}
+
+	spdlog::info("[rigOsc] smokeLoopback OK (udp+tcp+multicast port={})", port);
 	restore();
 	return true;
 }
