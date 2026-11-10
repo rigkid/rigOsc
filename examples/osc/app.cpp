@@ -8,7 +8,7 @@
 #include "packs/rigComponent/src/rig.h"
 #include "packs/rigComponent/src/rigComponent.h"
 #include "packs/rigImGui/src/ExportPng.h"
-#include "packs/rigImGui/src/IWindow.h"
+#include "packs/rigImGui/src/ImGuiPanel.h"
 #include "packs/rigImGui/src/Mui.h"
 #include "packs/rigImGui/src/rigImGui.h"
 #include "packs/rigOsc/src/CNetworkIdentity.h"
@@ -62,11 +62,11 @@ bool argBool(const rigkit::osc::OscArg& a, bool& out) {
 	return false;
 }
 
-class ShowControlWindow : public rigkit::IWindow {
+class ShowControlWindow : public rigkit::ImGuiPanel {
   public:
 	ShowControlWindow(rigkit::rigOsc* osc, float* master, bool* blackout, float* color,
 					  std::string* status, const int* heartbeat, const std::string* lastFrom)
-		: IWindow("Show Control", 0), m_osc(osc), m_master(master), m_blackout(blackout),
+		: ImGuiPanel("Show Control", 0), m_osc(osc), m_master(master), m_blackout(blackout),
 		  m_color(color), m_status(status), m_heartbeat(heartbeat), m_lastFrom(lastFrom) {}
 
   protected:
