@@ -225,11 +225,12 @@ void OscHeroApp::setup() {
 	m_lamp = rig::makeCircle(cx, cy, 78.f, rig::fill(m_color[0], m_color[1], m_color[2]), "lamp");
 
 	if (auto* ui = m_engine->getUiManager()) {
-		if (auto* mui = dynamic_cast<rigkit::Mui*>(ui)) {
+		auto* mui = dynamic_cast<rigkit::Mui*>(ui);
+		if (mui) {
 			mui->setDockPassthroughCentral(true);
 			mui->setFirstRunHostDockLayout({"Show Control"});
 		}
-		if (auto* wm = ui->getWindowManager()) {
+		if (auto* wm = mui ? mui->getWindowManager() : nullptr) {
 			wm->createWindow<ShowControlWindow>(m_osc.get(), &m_master, &m_blackout, m_color,
 												&m_status, &m_heartbeat, &m_lastFrom);
 			wm->showWindow("Show Control");
