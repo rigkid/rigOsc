@@ -29,14 +29,14 @@ class TcpPort;
  * UDP is the default. TCP (size prefix or SLIP) and IPv4 multicast are opt-in
  * on `COscEndpoint`. Show-bus addresses are `/<appName>/<networkId>/<leaf>`
  * and broadcast `/<appName>/<leaf>`. The app names each leaf and registers it
- * with @ref addBusListener. Empty `addressPrefix` becomes `/` plus the host app name.
+ * with #addBusListener. Empty `addressPrefix` becomes `/` plus the host app name.
  *
  * Pattern listeners (`?` `*` `[]` `{}`, `**`) share the same socket.
  * A socket thread receives and sends so a slow Draw does not drop datagrams.
- * @ref update delivers to listeners, so callbacks stay on the SUDE thread.
+ * #update delivers to listeners, so callbacks stay on the SUDE thread.
  * A bundle with a future timetag is held until that time, then delivered in order.
  *
- * After pack setup, product apps call @ref applyCommandLine so network id / ports
+ * After pack setup, product apps call #applyCommandLine so network id / ports
  * come from the same CLI everywhere.
  */
 class rigOsc : public IPack {
@@ -100,18 +100,18 @@ class rigOsc : public IPack {
 
 	/**
 	 * @brief Network id in a directed bus address.
-	 * @return Empty when `address` is broadcast or not under @ref busPrefix.
+	 * @return Empty when `address` is broadcast or not under #busPrefix.
 	 */
 	std::string busSenderId(const std::string& address) const;
 
 	/**
-	 * @brief Register an address-pattern callback. Returns an id for @ref removeListener.
+	 * @brief Register an address-pattern callback. Returns an id for #removeListener.
 	 * @details Pattern uses OSC 1.0 `?` `*` `[]` `{}` plus pack `**`. No UI here.
 	 */
 	int addListener(const std::string& pattern, OscListener fn);
 
 	/**
-	 * @brief Register one show-bus leaf. Returns an id for @ref removeListener.
+	 * @brief Register one show-bus leaf. Returns an id for #removeListener.
 	 * @details Fires for `/<appName>/<anyNetworkId>/<leaf>` and `/<appName>/<leaf>`.
 	 * The app owns the leaf name and what the arguments mean.
 	 */

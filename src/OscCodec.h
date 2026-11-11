@@ -56,7 +56,7 @@ struct OscSymbol {
 /**
  * @brief OSC 1.1 array (`[` `]`).
  * @details Nested arrays are values. Copying an array copies its items.
- * Read and write them through @ref items.
+ * Read and write them through `items()`.
  */
 struct OscArray {
 	struct Store;

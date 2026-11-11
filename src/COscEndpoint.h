@@ -28,7 +28,7 @@ struct COscEndpoint {
 	bool tcpListen = false;
 	int tcpPort = 0;			///< 0 uses `listenPort`.
 	bool tcpConnect = false;	///< Dial `sendHost:sendPort` and send there on TCP.
-	int streamFraming = 0;		///< 0 size prefix, 1 SLIP. See @ref kOscStreamFramingNames.
+	int streamFraming = 0;		///< 0 size prefix, 1 SLIP. See `kOscStreamFramingNames`.
 	std::string multicastGroup; ///< IPv4 group. Empty = unicast.
 	int multicastTtl = 1;
 
